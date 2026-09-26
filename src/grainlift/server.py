@@ -4,16 +4,19 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import inspect
 import json
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Concatenate, ParamSpec, TypeVar
+from typing import Any, Concatenate, ParamSpec, TypeVar
 
 import falcon
 import pyarrow as pa
@@ -21,8 +24,10 @@ from vgi_rpc import AuthContext, CallContext, RpcServer, Stream
 from vgi_rpc.http import make_wsgi_app
 
 from . import protocol as p
-from .api import AdbcError, Connection, Limits, QueryResult, Worker
+from .api import AdbcError, Connection, Limits, OptionValue, QueryResult, Statement, Worker
+from .binding import BindUpload, decode_schema
 from .credentials import TokenStore
+from .options import configured_options, decode_json, decode_options, decode_value, encode_value, validate_key
 from .telemetry import PrivateApplication
 
 P = ParamSpec("P")
@@ -100,8 +105,27 @@ class _Result:
 
 @dataclass
 class _Statement:
-    sql: str | None = None
+    backend: Statement
     result_id: str | None = None
+    binding: BindUpload | None = None
+    binding_id: str | None = None
+    upload: BindUpload | None = None
+    upload_id: str | None = None
+
+    def close(self) -> None:
+        """Release the backend before its retained parameter reader."""
+        with suppress(Exception):
+            self.backend.close()
+        if self.upload is not None:
+            with suppress(Exception):
+                self.upload.close()
+            self.upload = None
+        self.upload_id = None
+        if self.binding is not None:
+            with suppress(Exception):
+                self.binding.close()
+            self.binding = None
+        self.binding_id = None
 
 
 @dataclass
@@ -126,6 +150,8 @@ class _Session:
         for result in self.results.values():
             result.close()
         self.results.clear()
+        for statement in self.statements.values():
+            statement.close()
         self.statements.clear()
         with suppress(Exception):  # Continue cleanup without logging worker secrets.
             self.connection.close()
@@ -135,15 +161,27 @@ class _Session:
 class Service:
     """Own handles for one worker. Use as a context manager or call close()."""
 
-    def __init__(self, worker: Worker, *, limits: Limits | None = None) -> None:
+    def __init__(
+        self,
+        worker: Worker,
+        *,
+        limits: Limits | None = None,
+        database_options: Mapping[str, OptionValue] | None = None,
+        connection_options: Mapping[str, OptionValue] | None = None,
+    ) -> None:
         """Start the handle registry and idle-resource reaper.
 
         Args:
             worker: Factory for independent principal-bound connections.
             limits: Service quotas and lifecycle deadlines; defaults to Limits().
+            database_options: Authoritative database settings callers may not override.
+            connection_options: Authoritative connection settings callers may not override.
         """
         self.worker = worker
         self.limits = limits or Limits()
+        self._database_options = configured_options(database_options, self.limits.request_bytes)
+        self._connection_options = configured_options(connection_options, self.limits.request_bytes)
+        self._partition_key = secrets.token_bytes(32)
         self._sessions: dict[str, _Session] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -175,6 +213,9 @@ class Service:
                 if now - session.touched >= self.limits.idle_seconds:
                     self._close_session(sid, session)
                 else:
+                    for statement in session.statements.values():
+                        if statement.upload is not None and now - statement.upload.touched >= self.limits.idle_seconds:
+                            self._discard_upload(statement)
                     for rid, result in list(session.results.items()):
                         if now - result.touched >= self.limits.idle_seconds:
                             session.results.pop(rid).close()
@@ -240,6 +281,60 @@ class Service:
         if result is not None:
             result.close()
 
+    @staticmethod
+    def _discard_upload(statement: _Statement) -> None:
+        if statement.upload is not None:
+            statement.upload.close()
+            statement.upload = None
+        statement.upload_id = None
+
+    @staticmethod
+    def _discard_binding(statement: _Statement) -> None:
+        Service._discard_upload(statement)
+        if statement.binding is not None:
+            statement.binding.close()
+            statement.binding = None
+        statement.binding_id = None
+
+    @staticmethod
+    def _require_complete_binding(statement: _Statement) -> None:
+        if statement.upload is not None:
+            raise AdbcError("Bind upload has not finished", "invalid_state")
+
+    def _ensure_result_slot(self, session: _Session) -> None:
+        if len(session.results) >= self.limits.results_per_session:
+            raise AdbcError("Result limit reached", "invalid_state")
+
+    def _encoded_schema(self, schema: pa.Schema) -> bytes:
+        encoded = p.schema_ipc(schema)
+        if len(encoded) > self.limits.batch_bytes:
+            raise AdbcError("Schema exceeds configured limit", "invalid_data")
+        return encoded
+
+    def _schema_response(self, schema: pa.Schema) -> pa.RecordBatch:
+        return p.batch(p.SCHEMA, schema_ipc=self._encoded_schema(schema))
+
+    @staticmethod
+    def _row_count(value: int | None) -> int | None:
+        if value is not None and (type(value) is not int or not -(2**63) <= value < 2**63):
+            raise AdbcError("Invalid affected row count", "invalid_data")
+        return value
+
+    def _register_result(self, session: _Session, query: QueryResult) -> pa.RecordBatch:
+        result = _Result(query)
+        try:
+            self._ensure_result_slot(session)
+            encoded = self._encoded_schema(query.schema)
+            rid = secrets.token_urlsafe(24)
+            response = p.batch(
+                p.EXECUTE, result_id=rid, rows_affected=self._row_count(query.rows_affected), schema_ipc=encoded
+            )
+        except Exception:
+            result.close()
+            raise
+        session.results[rid] = result
+        return response
+
     @guarded
     def open_connection(
         self, target: str, database_options_json: str, connection_options_json: str, ctx: CallContext
@@ -248,13 +343,15 @@ class Service:
         principal = self._principal(ctx)
         if target != self.worker.target:
             raise AdbcError("Target is unavailable", "not_found")
-        for encoded in (database_options_json, connection_options_json):
-            try:
-                options = json.loads(encoded)
-            except (ValueError, TypeError):
-                raise AdbcError("Invalid options", "invalid_arguments") from None
-            if options != []:
-                raise AdbcError("Caller-supplied options are not supported", "not_implemented")
+        database_options = decode_options(database_options_json, self.limits.request_bytes)
+        connection_options = decode_options(connection_options_json, self.limits.request_bytes)
+        configured_keys = self._database_options.keys() | self._connection_options.keys()
+        if database_options.keys() & configured_keys:
+            raise AdbcError("Database option is configured by the server", "unauthorized")
+        if connection_options.keys() & configured_keys:
+            raise AdbcError("Connection option is configured by the server", "unauthorized")
+        database_options.update(self._database_options)
+        connection_options.update(self._connection_options)
         with self._lock:
             if self._closed:
                 raise AdbcError("Service is closed", "invalid_state")
@@ -264,7 +361,7 @@ class Service:
         connection = None
         inserted = False
         try:
-            connection = self.worker.connect(principal)
+            connection = self.worker.open_connection(principal, database_options, connection_options)
             sid = secrets.token_urlsafe(24)
             response = p.batch(p.SESSION, session_id=sid)
             with self._lock:
@@ -295,15 +392,19 @@ class Service:
         if len(session.statements) >= self.limits.statements_per_session:
             raise AdbcError("Statement limit reached", "invalid_state")
         statement_id = secrets.token_urlsafe(24)
-        session.statements[statement_id] = _Statement()
+        session.statements[statement_id] = _Statement(session.connection.new_statement())
         return p.batch(p.STATEMENT, session_id=session_id, statement_id=statement_id)
 
     @guarded
     def close_statement(self, session_id: str, statement_id: str, ctx: CallContext) -> pa.RecordBatch:
         """Close a statement and its active result."""
         session, statement = self._statement(session_id, statement_id, ctx)
+        # Cancellation does not take the session lock. Remove the handle under
+        # its lock before backend teardown so it cannot enter a closing object.
+        with session.cancel_lock:
+            del session.statements[statement_id]
         self._discard_result(session, statement)
-        del session.statements[statement_id]
+        statement.close()
         return p.batch(p.OK, ok=True)
 
     @guarded
@@ -313,41 +414,27 @@ class Service:
         if len(sql.encode("utf-8")) > self.limits.sql_bytes:
             raise AdbcError("SQL exceeds configured limit", "invalid_arguments")
         self._discard_result(session, statement)
-        statement.sql = sql
+        statement.backend.set_sql_query(sql)
+        self._discard_binding(statement)
         return p.batch(p.OK, ok=True)
 
     @guarded
     def execute(self, session_id: str, statement_id: str, ctx: CallContext) -> pa.RecordBatch:
         """Execute SQL and return its schema and lazy batch iterator."""
         session, statement = self._statement(session_id, statement_id, ctx)
+        self._require_complete_binding(statement)
         self._discard_result(session, statement)
-        if statement.sql is None:
-            raise AdbcError("Set a query before execution", "invalid_state")
-        query = session.connection.execute(statement.sql)
-        result = _Result(query)
-        try:
-            encoded = p.schema_ipc(query.schema)
-            if len(encoded) > self.limits.batch_bytes:
-                raise AdbcError("Schema exceeds configured limit", "invalid_data")
-            rid = secrets.token_urlsafe(24)
-            response = p.batch(p.EXECUTE, result_id=rid, rows_affected=query.rows_affected, schema_ipc=encoded)
-        except Exception:
-            result.close()
-            raise
-        session.results[rid] = result
-        statement.result_id = rid
+        self._ensure_result_slot(session)
+        response = self._register_result(session, statement.backend.execute())
+        statement.result_id = response.column("result_id")[0].as_py()
         return response
 
     @guarded
     def execute_schema(self, session_id: str, statement_id: str, ctx: CallContext) -> pa.RecordBatch:
         """Infer the result schema without opening a cursor."""
-        session, statement = self._statement(session_id, statement_id, ctx)
-        if statement.sql is None:
-            raise AdbcError("Set a query before schema inference", "invalid_state")
-        encoded = p.schema_ipc(session.connection.execute_schema(statement.sql))
-        if len(encoded) > self.limits.batch_bytes:
-            raise AdbcError("Schema exceeds configured limit", "invalid_data")
-        return p.batch(p.SCHEMA, schema_ipc=encoded)
+        _, statement = self._statement(session_id, statement_id, ctx)
+        self._require_complete_binding(statement)
+        return self._schema_response(statement.backend.execute_schema())
 
     @guarded
     def read_result(self, session_id: str, result_id: str, sequence: int, ctx: CallContext) -> Stream[p.ResultCursor]:
@@ -401,17 +488,32 @@ class Service:
     @guarded
     def set_connection_option(self, session_id: str, key: str, value_json: str, ctx: CallContext) -> pa.RecordBatch:
         """Set connection option when supported."""
-        self._session(session_id, ctx)
-        try:
-            value = json.loads(value_json)
-        except (ValueError, TypeError):
-            raise AdbcError("Invalid option value", "invalid_arguments") from None
-        if key == "adbc.connection.autocommit" and value == {
-            "type": "string",
-            "value": "true",
-        }:
-            return p.batch(p.OK, ok=True)
-        raise AdbcError("Connection option is not supported", "not_implemented")
+        session = self._session(session_id, ctx)
+        key = self._option_key(key)
+        if key in self._database_options or key in self._connection_options:
+            raise AdbcError("Connection option is configured by the server", "unauthorized")
+        session.connection.set_option(key, decode_value(decode_json(value_json, self.limits.request_bytes)))
+        return p.batch(p.OK, ok=True)
+
+    def _option_key(self, key: str) -> str:
+        validate_key(key)
+        if len(key.encode()) > self.limits.request_bytes:
+            raise AdbcError("Option key exceeds configured limit", "invalid_arguments")
+        return key
+
+    def _option_response(self, value: OptionValue, value_type: str) -> pa.RecordBatch:
+        if isinstance(value, str | bytes) and len(value) > self.limits.batch_bytes:
+            raise AdbcError("Option value exceeds configured limit", "invalid_data")
+        encoded = json.dumps(encode_value(value, value_type), allow_nan=False)
+        if len(encoded.encode()) > self.limits.batch_bytes:
+            raise AdbcError("Option value exceeds configured limit", "invalid_data")
+        return p.batch(p.VALUE, value_json=encoded)
+
+    @staticmethod
+    def _value_type(value_type: str) -> str:
+        if value_type not in {"string", "bytes", "int", "double"}:
+            raise AdbcError("Invalid option type", "invalid_arguments")
+        return value_type
 
     def cancel_connection(self, session_id: str, ctx: CallContext) -> pa.RecordBatch:
         """Call a nonblocking backend cancellation hook without the session lock."""
@@ -436,7 +538,7 @@ class Service:
             if session.active_statement != statement_id:
                 raise AdbcError("No cancellable operation on this statement", "not_implemented")
             try:
-                session.connection.cancel()
+                session.statements[statement_id].backend.cancel()
             except AdbcError:
                 raise
             except Exception:  # noqa: BLE001 -- sanitize downstream cancellation errors
@@ -446,35 +548,321 @@ class Service:
     @guarded
     def get_connection_option(self, session_id: str, key: str, value_type: str, ctx: CallContext) -> pa.RecordBatch:
         """Get connection option when supported."""
-        self._session(session_id, ctx)
-        if key == "adbc.connection.autocommit" and value_type == "string":
-            return p.batch(p.VALUE, value_json=json.dumps({"type": "string", "value": "true"}))
-        raise AdbcError("Connection option is not supported", "not_implemented")
+        session = self._session(session_id, ctx)
+        value_type = self._value_type(value_type)
+        return self._option_response(session.connection.get_option(self._option_key(key), value_type), value_type)
 
-    def __getattr__(self, name: str) -> Callable[..., Stream[p.ResultCursor]]:
-        """Resolve unsupported protocol methods to authenticated ADBC errors."""
-        if name.startswith("_") or not callable(getattr(p.Grainlift, name, None)):
-            raise AttributeError(name)
+    @guarded
+    def set_statement_option(
+        self,
+        session_id: str,
+        statement_id: str,
+        key: str,
+        value_json: str,
+        ctx: CallContext,
+    ) -> pa.RecordBatch:
+        """Set a typed backend statement option, including ingestion configuration."""
+        _, statement = self._statement(session_id, statement_id, ctx)
+        key = self._option_key(key)
+        if key in self._database_options or key in self._connection_options:
+            raise AdbcError("Statement option is configured by the server", "unauthorized")
+        statement.backend.set_option(key, decode_value(decode_json(value_json, self.limits.request_bytes)))
+        return p.batch(p.OK, ok=True)
 
-        def unsupported(
-            session_id: str,
-            statement_id: str | None = None,
-            schema_ipc: bytes | None = None,
-            args_json: str | None = None,
-            key: str | None = None,
-            payload: bytes | None = None,
-            value_type: str | None = None,
-            value_json: str | None = None,
-            *,
-            ctx: CallContext,
-        ) -> Stream[p.ResultCursor]:
-            with self._lock:
-                session = self._session(session_id, ctx)
-                if statement_id is not None and statement_id not in session.statements:
-                    raise AdbcError("Statement is unavailable", "not_found")
-                raise AdbcError(f"{name} is not implemented", "not_implemented")
+    @guarded
+    def get_statement_option(
+        self,
+        session_id: str,
+        statement_id: str,
+        key: str,
+        value_type: str,
+        ctx: CallContext,
+    ) -> pa.RecordBatch:
+        """Read a backend statement option in its requested representation."""
+        _, statement = self._statement(session_id, statement_id, ctx)
+        value_type = self._value_type(value_type)
+        return self._option_response(statement.backend.get_option(self._option_key(key), value_type), value_type)
 
-        return unsupported
+    @guarded
+    def commit(self, session_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Commit the backend transaction while retaining connection ownership."""
+        self._session(session_id, ctx).connection.commit()
+        return p.batch(p.OK, ok=True)
+
+    @guarded
+    def rollback(self, session_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Roll back the backend transaction without emulating database behavior."""
+        self._session(session_id, ctx).connection.rollback()
+        return p.batch(p.OK, ok=True)
+
+    @guarded
+    def prepare(self, session_id: str, statement_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Prepare a statement through the backend capability hook."""
+        session, statement = self._statement(session_id, statement_id, ctx)
+        self._require_complete_binding(statement)
+        self._discard_result(session, statement)
+        statement.backend.prepare()
+        return p.batch(p.OK, ok=True)
+
+    @guarded
+    def set_substrait_plan(
+        self, session_id: str, statement_id: str, payload: bytes, ctx: CallContext
+    ) -> pa.RecordBatch:
+        """Install a bounded serialized Substrait plan on the backend statement."""
+        session, statement = self._statement(session_id, statement_id, ctx)
+        if len(payload) > self.limits.request_bytes:
+            raise AdbcError("Substrait plan exceeds configured limit", "invalid_arguments")
+        self._discard_result(session, statement)
+        statement.backend.set_substrait_plan(payload)
+        self._discard_binding(statement)
+        return p.batch(p.OK, ok=True)
+
+    @guarded
+    def get_parameter_schema(self, session_id: str, statement_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Return the backend's prepared parameter schema within the schema budget."""
+        _, statement = self._statement(session_id, statement_id, ctx)
+        return self._schema_response(statement.backend.get_parameter_schema())
+
+    @guarded
+    def execute_update(self, session_id: str, statement_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Execute an update or ingestion statement and retain its affected-row count."""
+        session, statement = self._statement(session_id, statement_id, ctx)
+        self._require_complete_binding(statement)
+        self._discard_result(session, statement)
+        return p.batch(p.UPDATE, rows_affected=self._row_count(statement.backend.execute_update()))
+
+    def _partition_owner(self, principal: str) -> str:
+        return hmac.new(
+            self._partition_key, (self.worker.target + "\0" + principal).encode(), hashlib.sha256
+        ).hexdigest()
+
+    def _seal_partition(self, descriptor: bytes, principal: str) -> bytes:
+        if not isinstance(descriptor, bytes) or len(descriptor) > self.limits.batch_bytes:
+            raise AdbcError("Partition descriptor exceeds configured limit", "invalid_data")
+        body = json.dumps(
+            [
+                time.time() + self.limits.idle_seconds,
+                self._partition_owner(principal),
+                base64.b64encode(descriptor).decode(),
+            ],
+            separators=(",", ":"),
+        ).encode()
+        return b"GLP1" + hmac.digest(self._partition_key, body, "sha256") + body
+
+    def _unseal_partition(self, payload: bytes, principal: str) -> bytes:
+        if len(payload) > self.limits.request_bytes:
+            raise AdbcError("Partition descriptor exceeds configured limit", "invalid_arguments")
+        if len(payload) < 36 or payload[:4] != b"GLP1":
+            raise AdbcError("Partition descriptor is unavailable", "not_found")
+        signature, body = payload[4:36], payload[36:]
+        if not hmac.compare_digest(signature, hmac.digest(self._partition_key, body, "sha256")):
+            raise AdbcError("Partition descriptor is unavailable", "not_found")
+        try:
+            expires, owner, encoded = json.loads(body)
+            if expires < time.time() or not hmac.compare_digest(owner, self._partition_owner(principal)):
+                raise ValueError("Unavailable partition")
+            return base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            raise AdbcError("Partition descriptor is unavailable", "not_found") from None
+
+    @guarded
+    def execute_partitions(self, session_id: str, statement_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Export bounded, expiring partition descriptors bound to the authenticated principal."""
+        session, statement = self._statement(session_id, statement_id, ctx)
+        self._require_complete_binding(statement)
+        self._discard_result(session, statement)
+        result = statement.backend.execute_partitions()
+        schema = self._encoded_schema(result.schema)
+        count = self._row_count(result.rows_affected)
+        if count is None or len(result.partitions) > self.limits.partitions_per_result:
+            raise AdbcError("Invalid partitioned result", "invalid_data")
+        descriptors: list[str] = []
+        size = len(schema) + 2
+        for descriptor in result.partitions:
+            sealed = self._seal_partition(descriptor, session.principal)
+            if len(sealed) > self.limits.request_bytes:
+                raise AdbcError("Partition descriptor exceeds configured limit", "invalid_data")
+            encoded = json.dumps(list(sealed), separators=(",", ":"))
+            size += len(encoded) + bool(descriptors)
+            if size > self.limits.batch_bytes:
+                raise AdbcError("Partitioned result exceeds configured limit", "invalid_data")
+            descriptors.append(encoded)
+        return p.batch(
+            p.PARTITIONS, rows_affected=count, schema_ipc=schema, partitions_json="[" + ",".join(descriptors) + "]"
+        )
+
+    @guarded
+    def read_partition(self, session_id: str, payload: bytes, ctx: CallContext) -> pa.RecordBatch:
+        """Read a validated partition through a fresh, independently bounded result handle."""
+        session = self._session(session_id, ctx)
+        descriptor = self._unseal_partition(payload, session.principal)
+        self._ensure_result_slot(session)
+        return self._register_result(session, session.connection.read_partition(descriptor))
+
+    def _arguments(self, args_json: str, allowed: set[str], required: set[str] | None = None) -> dict[str, Any]:
+        args = decode_json(args_json, self.limits.request_bytes)
+        if not isinstance(args, dict) or args.keys() - allowed or (required or set()) - args.keys():
+            raise AdbcError("Invalid metadata arguments", "invalid_arguments")
+        return args
+
+    @staticmethod
+    def _optional_string(args: dict[str, Any], name: str, required: bool = False) -> str | None:
+        value = args.get(name)
+        if (value is None and required) or (value is not None and not isinstance(value, str)):
+            raise AdbcError("Invalid metadata string argument", "invalid_arguments")
+        return value
+
+    @guarded
+    def get_info(self, session_id: str, args_json: str, ctx: CallContext) -> pa.RecordBatch:
+        """Read requested unsigned ADBC information codes as a bounded Arrow result."""
+        session = self._session(session_id, ctx)
+        args = self._arguments(args_json, {"codes"})
+        codes = args.get("codes")
+        if codes is not None and (
+            not isinstance(codes, list) or any(type(code) is not int or not 0 <= code < 2**32 for code in codes)
+        ):
+            raise AdbcError("Invalid information codes", "invalid_arguments")
+        self._ensure_result_slot(session)
+        return self._register_result(session, session.connection.get_info(codes))
+
+    @guarded
+    def get_objects(self, session_id: str, args_json: str, ctx: CallContext) -> pa.RecordBatch:
+        """Read the backend's hierarchical object metadata and preserve its filters."""
+        session = self._session(session_id, ctx)
+        args = self._arguments(
+            args_json, {"depth", "catalog", "db_schema", "table_name", "table_type", "column_name"}, {"depth"}
+        )
+        depth, table_types = args["depth"], args.get("table_type")
+        if type(depth) is not int or depth not in {0, 1, 2, 3}:
+            raise AdbcError("Invalid object depth", "invalid_arguments")
+        if table_types is not None and (
+            not isinstance(table_types, list) or any(not isinstance(value, str) for value in table_types)
+        ):
+            raise AdbcError("Invalid table type filter", "invalid_arguments")
+        catalog, db_schema, table_name, column_name = (
+            self._optional_string(args, name) for name in ("catalog", "db_schema", "table_name", "column_name")
+        )
+        self._ensure_result_slot(session)
+        return self._register_result(
+            session, session.connection.get_objects(depth, catalog, db_schema, table_name, table_types, column_name)
+        )
+
+    @guarded
+    def get_table_schema(self, session_id: str, args_json: str, ctx: CallContext) -> pa.RecordBatch:
+        """Read a table schema after validating the metadata filter arguments."""
+        session = self._session(session_id, ctx)
+        args = self._arguments(args_json, {"catalog", "db_schema", "table_name"}, {"table_name"})
+        table_name = self._optional_string(args, "table_name", required=True)
+        assert table_name is not None
+        return self._schema_response(
+            session.connection.get_table_schema(
+                self._optional_string(args, "catalog"), self._optional_string(args, "db_schema"), table_name
+            )
+        )
+
+    @guarded
+    def get_table_types(self, session_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Return a bounded table-type discovery cursor."""
+        session = self._session(session_id, ctx)
+        self._ensure_result_slot(session)
+        return self._register_result(session, session.connection.get_table_types())
+
+    @guarded
+    def get_statistic_names(self, session_id: str, ctx: CallContext) -> pa.RecordBatch:
+        """Return a bounded statistic-name discovery cursor."""
+        session = self._session(session_id, ctx)
+        self._ensure_result_slot(session)
+        return self._register_result(session, session.connection.get_statistic_names())
+
+    @guarded
+    def get_statistics(self, session_id: str, args_json: str, ctx: CallContext) -> pa.RecordBatch:
+        """Read backend statistics with exact or approximate semantics preserved."""
+        session = self._session(session_id, ctx)
+        args = self._arguments(args_json, {"catalog", "db_schema", "table_name", "approximate"}, {"approximate"})
+        approximate = args["approximate"]
+        if type(approximate) is not bool:
+            raise AdbcError("Invalid approximation flag", "invalid_arguments")
+        catalog, db_schema, table_name = (
+            self._optional_string(args, name) for name in ("catalog", "db_schema", "table_name")
+        )
+        self._ensure_result_slot(session)
+        return self._register_result(
+            session, session.connection.get_statistics(catalog, db_schema, table_name, approximate)
+        )
+
+    def _start_binding(
+        self, session_id: str, statement_id: str, schema_ipc: bytes, stream: bool, ctx: CallContext
+    ) -> Stream[p.BindCursor]:
+        session, statement = self._statement(session_id, statement_id, ctx)
+        schema = decode_schema(schema_ipc, self.limits.batch_bytes)
+        self._discard_result(session, statement)
+        self._discard_upload(statement)
+        upload_id = secrets.token_urlsafe(24)
+        statement.upload = BindUpload(
+            schema, limit=self.limits.bind_bytes, batch_limit=self.limits.batch_bytes, stream=stream
+        )
+        statement.upload_id = upload_id
+        return Stream(
+            output_schema=p.OK,
+            input_schema=schema,
+            state=p.BindCursor(session_id, statement_id, upload_id),
+        )
+
+    @guarded
+    def bind(self, session_id: str, statement_id: str, schema_ipc: bytes, ctx: CallContext) -> Stream[p.BindCursor]:
+        """Begin a bounded single-batch Arrow binding exchange."""
+        return self._start_binding(session_id, statement_id, schema_ipc, False, ctx)
+
+    @guarded
+    def bind_stream(
+        self, session_id: str, statement_id: str, schema_ipc: bytes, ctx: CallContext
+    ) -> Stream[p.BindCursor]:
+        """Begin a bounded Arrow stream exchange backed by an anonymous temporary file."""
+        return self._start_binding(session_id, statement_id, schema_ipc, True, ctx)
+
+    @guarded
+    def push_binding(
+        self,
+        session_id: str,
+        statement_id: str,
+        upload_id: str,
+        sequence: int,
+        batch: pa.RecordBatch,
+        finish: bool,
+        ctx: CallContext,
+    ) -> None:
+        """Stage one turn and bind only after an explicit, successfully completed finish."""
+        _, statement = self._statement(session_id, statement_id, ctx)
+        pending = upload_id == statement.upload_id
+        upload = statement.upload if pending else statement.binding if upload_id == statement.binding_id else None
+        if upload is None:
+            raise AdbcError("Bind upload is unavailable", "not_found")
+        try:
+            if not upload.accept(batch, sequence, finish=finish):
+                return
+            assert upload.reader is not None
+            if upload.stream:
+                statement.backend.bind_stream(upload.reader)
+            else:
+                statement.backend.bind(next(upload.reader))
+            # The backend has replaced its prior binding. Only now release its
+            # old reader; a failed or cancelled upload must leave it usable.
+            previous = statement.binding
+            statement.binding, statement.binding_id = upload, upload_id
+            statement.upload, statement.upload_id = None, None
+            if previous is not None:
+                previous.close()
+        except Exception:
+            if pending:
+                self._discard_upload(statement)
+            raise
+
+    @guarded
+    def cancel_binding(self, session_id: str, statement_id: str, upload_id: str, ctx: CallContext) -> None:
+        """Release pending input; stream teardown after a final acknowledgement preserves binding."""
+        _, statement = self._statement(session_id, statement_id, ctx)
+        if statement.upload_id == upload_id:
+            self._discard_upload(statement)
 
     def app(self, *, tokens: dict[str, str] | TokenStore) -> PrivateApplication:
         """Create authenticated WSGI app; token values map to configured principals."""

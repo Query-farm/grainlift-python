@@ -253,7 +253,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pyarrow", specifier = ">=19" },
-    { name = "vgi-rpc", extras = ["http"], git = "https://github.com/Query-farm/vgi-rpc-python.git?rev=cf0564f0ea9780ffbbff18995b3d027d3aa41d75" },
+    { name = "vgi-rpc", extras = ["http"], git = "https://github.com/Query-farm/vgi-rpc-python.git?rev=d0ee383502fcdf57200c24181dbeda13ac11807e" },
 ]
 
 [package.metadata.requires-dev]
@@ -771,7 +771,7 @@ wheels = [
 [[package]]
 name = "vgi-rpc"
 version = "0.47.1"
-source = { git = "https://github.com/Query-farm/vgi-rpc-python.git?rev=cf0564f0ea9780ffbbff18995b3d027d3aa41d75#cf0564f0ea9780ffbbff18995b3d027d3aa41d75" }
+source = { git = "https://github.com/Query-farm/vgi-rpc-python.git?rev=d0ee383502fcdf57200c24181dbeda13ac11807e#d0ee383502fcdf57200c24181dbeda13ac11807e" }
 dependencies = [
     { name = "docstring-parser" },
     { name = "pyarrow" },

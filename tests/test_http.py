@@ -11,7 +11,7 @@ import pyarrow as pa
 import pytest
 import waitress
 from test_service import TestConnection, TestWorker, value
-from vgi_rpc import RpcError
+from vgi_rpc import AnnotatedBatch, RpcError
 from vgi_rpc.http import http_connect
 from vgi_rpc.http._testing import _SyncTestClient
 from vgi_rpc.rpc import rpc_methods
@@ -20,7 +20,7 @@ from waitress.adjustments import Adjustments
 from waitress.parser import HTTPRequestParser
 
 from grainlift import Limits, Service, serve
-from grainlift.protocol import Grainlift
+from grainlift.protocol import Grainlift, schema_ipc
 
 
 def test_continuation_checks_principal() -> None:
@@ -61,12 +61,17 @@ def test_unsupported_bind_has_adbc_error() -> None:
                 "session_id",
             )
             stmt = value(rpc.new_statement(session_id=sid), "statement_id")
-            with pytest.raises(RpcError, match="not_implemented"):
+            with (
+                pytest.raises(RpcError, match="not_implemented"),
                 rpc.bind(
                     session_id=sid,
                     statement_id=stmt,
-                    schema_ipc=pa.schema([]).serialize().to_pybytes(),
-                )
+                    schema_ipc=schema_ipc(pa.schema([])),
+                ) as stream,
+            ):
+                empty = pa.RecordBatch.from_pydict({}, schema=pa.schema([]))
+                stream.exchange(AnnotatedBatch(empty))
+                stream.exchange(AnnotatedBatch(empty, pa.KeyValueMetadata({b"GRAINLIFT:bind_finish": b"1"})))
 
 
 def test_transport_logs_are_suppressed(caplog: pytest.LogCaptureFixture) -> None:

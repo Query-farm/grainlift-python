@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Annotated, ClassVar, Protocol
 
 import pyarrow as pa
-from vgi_rpc import CallContext, OutputCollector, ProducerState, Stream
+from vgi_rpc import AnnotatedBatch, CallContext, ExchangeState, OutputCollector, ProducerState, Stream
 
 
 def schema(*fields: tuple[str, pa.DataType, bool]) -> pa.Schema:
@@ -72,6 +72,29 @@ class ResultCursor(ProducerState):
     def on_cancel(self, ctx: CallContext) -> None:
         """Release the server cursor when the pull stream is cancelled."""
         ctx.implementation.close_result(self.session_id, self.result_id, ctx)
+
+
+@dataclass
+class BindCursor(ExchangeState):
+    """Signed upload cursor; bounded Arrow data remains in the owning service."""
+
+    session_id: str
+    statement_id: str
+    upload_id: str
+    sequence: int = 0
+
+    def exchange(self, input: AnnotatedBatch, out: OutputCollector, ctx: CallContext) -> None:
+        """Stage one batch or finish input and acknowledge only completed work."""
+        finish = input.custom_metadata is not None and b"GRAINLIFT:bind_finish" in input.custom_metadata
+        ctx.implementation.push_binding(
+            self.session_id, self.statement_id, self.upload_id, self.sequence, input.batch, finish, ctx
+        )
+        out.emit(batch(OK, ok=True))
+        self.sequence += 1
+
+    def on_cancel(self, ctx: CallContext) -> None:
+        """Discard incomplete input without unbinding a successfully finished upload."""
+        ctx.implementation.cancel_binding(self.session_id, self.statement_id, self.upload_id, ctx)
 
 
 class Grainlift(Protocol):
@@ -168,11 +191,11 @@ class Grainlift(Protocol):
         """Get statement option through the ADBC wire protocol."""
         ...
 
-    def bind(self, session_id: str, statement_id: str, schema_ipc: bytes) -> Stream[ResultCursor]:
+    def bind(self, session_id: str, statement_id: str, schema_ipc: bytes) -> Stream[BindCursor]:
         """Bind through the ADBC wire protocol."""
         ...
 
-    def bind_stream(self, session_id: str, statement_id: str, schema_ipc: bytes) -> Stream[ResultCursor]:
+    def bind_stream(self, session_id: str, statement_id: str, schema_ipc: bytes) -> Stream[BindCursor]:
         """Bind stream through the ADBC wire protocol."""
         ...
 
