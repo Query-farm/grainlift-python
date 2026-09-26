@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Strict, bounded control records using the published VGI Arrow codec."""
 
+from __future__ import annotations
+
 from typing import Any, Self
 
 import pyarrow as pa

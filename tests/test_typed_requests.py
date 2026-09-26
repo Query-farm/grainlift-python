@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Typed request wire schemas, strict decoding, filters, and session ownership."""
 
+from __future__ import annotations
+
 from io import BytesIO
 from typing import Any
 

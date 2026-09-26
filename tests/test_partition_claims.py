@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opaque partition tokens preserve typed claims, bounds, and signature-first validation."""
 
+from __future__ import annotations
+
 import hmac
 import time
 from typing import Any
