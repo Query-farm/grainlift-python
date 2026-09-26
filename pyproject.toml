@@ -7,6 +7,9 @@ license = "Apache-2.0"
 readme = "README.md"
 dependencies = ["vgi-rpc[http]>=0.47.1", "pyarrow>=19"]
 
+[project.optional-dependencies]
+granian = ["granian>=2.8.3,<2.9"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -26,7 +29,7 @@ exclude = [
 include = ["/src", "/tests", "/docs", "/README.md", "/LICENSE", "/pyproject.toml", "/check_quality.sh"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.11", "mypy>=1.15", "pyarrow-stubs", "adbc-driver-manager>=1.7"]
+dev = ["pytest>=8", "ruff>=0.11", "mypy>=1.15", "pyarrow-stubs", "adbc-driver-manager>=1.7", "cryptography>=45"]
 
 [tool.ruff]
 line-length = 120

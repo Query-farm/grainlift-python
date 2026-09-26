@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import signal
 import time
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, suppress
 from multiprocessing.connection import Connection as PipeConnection
+from pathlib import Path
 from typing import cast
 
 import pyarrow as pa
@@ -19,6 +22,53 @@ from grainlift import AdbcError, Connection, IsolatedWorker, QueryResult, Worker
 from grainlift.isolation import _BoundedBuffer, _decode, _encode, _ProcessConnection
 
 SCHEMA = pa.schema([("n", pa.int64())])
+
+
+def orphan_owner(control: PipeConnection, marker: str) -> None:
+    """Start an isolated callback and publish its PID before the owner is terminated."""
+    worker = IsolatedWorker("test_isolation:ProcessTestWorker", timeout_seconds=60)
+    with closing(worker.connect("alice")) as connection:
+        assert isinstance(connection, _ProcessConnection)
+        control.send(connection._process.pid)
+        connection.execute(f"owner_hang:{marker}")
+
+
+def test_owner_death_terminates_active_isolated_backend(tmp_path: Path) -> None:
+    """An isolated callback must not survive termination of its owning host process."""
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    marker = tmp_path / "started"
+    owner = context.Process(target=orphan_owner, args=(child, str(marker)))
+    owner.start()
+    child.close()
+    backend_pid = None
+    try:
+        assert parent.poll(15)
+        backend_pid = parent.recv()
+        ready_deadline = time.monotonic() + 5
+        while not marker.exists():
+            assert time.monotonic() < ready_deadline
+            time.sleep(0.01)
+        owner.terminate()
+        owner.join(5)
+        assert not owner.is_alive()
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.kill(backend_pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, "Isolated backend survived its owner"
+            time.sleep(0.01)
+    finally:
+        parent.close()
+        if owner.is_alive():
+            owner.kill()
+            owner.join(5)
+        if backend_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(backend_pid, signal.SIGKILL)
+        owner.close()
 
 
 class ProcessTestWorker(Worker):
@@ -47,6 +97,9 @@ class ProcessTestConnection(Connection):
 
     def execute(self, sql: str) -> QueryResult:
         """Execute SQL and return its schema and lazy batch iterator."""
+        if sql.startswith("owner_hang:"):
+            Path(sql.removeprefix("owner_hang:")).touch()
+            time.sleep(30)
         if sql == "hang":
             time.sleep(30)
         if sql == "exit":

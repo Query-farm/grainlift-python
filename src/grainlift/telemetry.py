@@ -6,9 +6,12 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 from wsgiref.types import StartResponse, WSGIApplication
+
+from ._wsgi import PrimedResponse
 
 _private_request = ContextVar("grainlift_private_request", default=False)
 _install_lock = threading.Lock()
@@ -20,6 +23,21 @@ class _TransportFilter(logging.Filter):
 
 
 _transport_filter = _TransportFilter()
+
+
+@contextmanager
+def private_transport() -> Iterator[None]:
+    """Suppress sensitive VGI diagnostics only within the current execution context.
+
+    Yields:
+        A private scope without changing global logging levels or handlers.
+    """
+    _install_filters()
+    token = _private_request.set(True)
+    try:
+        yield
+    finally:
+        _private_request.reset(token)
 
 
 def _install_filters() -> None:
@@ -54,6 +72,10 @@ class PrivateApplication:
         _install_filters()
 
     def __call__(self, environ: dict[str, Any], start_response: StartResponse) -> Iterator[bytes]:
+        """Expose headers eagerly and retain request context across host threads."""
+        return PrimedResponse(self._iterate, environ, start_response)
+
+    def _iterate(self, environ: dict[str, Any], start_response: StartResponse) -> Iterator[bytes]:
         """Serve a request within a private transport logging context."""
         _install_filters()
         token = _private_request.set(True)

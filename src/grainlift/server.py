@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Query Farm LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded, process-local Grainlift sessions and HTTP serving."""
+"""Bounded, process-local Grainlift sessions and authenticated WSGI application."""
 
 from __future__ import annotations
 

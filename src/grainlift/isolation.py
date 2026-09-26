@@ -22,6 +22,7 @@ import threading
 import time
 from collections.abc import Buffer, Iterator, Mapping
 from multiprocessing.connection import Connection as PipeConnection
+from multiprocessing.connection import wait
 from typing import Any
 
 import pyarrow as pa
@@ -373,6 +374,15 @@ class _ChildState:
         return {"ok": True}, b""
 
 
+def _watch_owner() -> None:
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        wait([parent.sentinel])
+        # The session owner is gone; no callback or IPC reply can be useful.
+        # Exit without running potentially stuck backend cleanup hooks.
+        os._exit(1)
+
+
 def _child_main(
     incoming: PipeConnection,
     outgoing: PipeConnection,
@@ -385,6 +395,7 @@ def _child_main(
     bind_limit: int,
     connection_options_json: str,
 ) -> None:
+    threading.Thread(target=_watch_owner, name="grainlift-owner-watch", daemon=True).start()
     # Worker-authored stdout/stderr must not accidentally escape into service logs.
     with open(os.devnull, "wb") as sink:
         os.dup2(sink.fileno(), 1)

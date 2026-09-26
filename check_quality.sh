@@ -5,6 +5,7 @@
 # with VGI-RPC's docstring-parser distribution.
 set -euo pipefail
 cd "$(dirname "$0")"
+uv sync --locked --extra granian
 uv run ruff check src tests
 uv run ruff format --check src tests
 uv run mypy src tests

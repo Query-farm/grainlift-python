@@ -11,6 +11,39 @@ permissions:
   contents: read
 
 jobs:
+  native-hosting:
+    name: Native ADBC hosting lifecycle (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Query-farm/grainlift
+          ref: e609935dff72a09d5ab63eddc5a4a7e88b6f61d4
+          path: native-driver
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: native-driver
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: 0.11.7
+      - run: uv sync --locked --extra granian --python 3.14
+      - run: cargo build --locked -p adbc-driver-grainlift
+        working-directory: native-driver
+      - name: Install the wheel and exercise real native transports
+        run: |
+          uv build
+          uv pip install --python .venv/bin/python --reinstall --no-deps dist/*.whl
+          export GRAINLIFT_NATIVE_DRIVER="$PWD/native-driver/target/debug/libadbc_driver_grainlift.so"
+          uv run --no-sync pytest -q tests/test_native_hosting.py tests/test_tcp.py tests/test_hosting.py tests/test_isolation.py
+
   test:
     name: Toolkit (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -27,7 +60,7 @@ jobs:
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           version: 0.11.7
-      - run: uv sync --locked --python '${{ matrix.python }}'
+      - run: uv sync --locked --extra granian --python '${{ matrix.python }}'
       - name: Ruff, strict mypy, and isolated pydoclint
         run: ./check_quality.sh
       - name: Build distributions and install the wheel

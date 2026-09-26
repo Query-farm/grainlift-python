@@ -4,7 +4,8 @@ Build ADBC services in Python. Applications load the existing native Grainlift
 ADBC driver; your worker supplies query behavior and lazy Arrow batches over
 VGI-RPC. No downstream ADBC driver is required.
 
-The toolkit exposes the Grainlift protocol 0.4.0 ADBC operation surface over HTTP:
+The toolkit exposes the Grainlift protocol 0.4.0 ADBC operation surface over HTTP
+and authenticated TCP/mTLS:
 transactions, statements, preparation, typed options, parameter batches and
 streams, updates and ingestion, metadata, partitioned results, and Substrait
 plans. Your backend implements each capability through `Connection` and
@@ -21,7 +22,7 @@ use `autocommit=True` with the Python ADBC driver manager.
 Python 3.13+ and [uv](https://docs.astral.sh/uv/) are required. Clone this repository
 and run:
 
-    uv sync --locked
+    uv sync --locked --extra granian
     ./check_quality.sh
     uv run --no-sync pytest
 
@@ -40,6 +41,33 @@ The CI workflow checks Linux/macOS with Python 3.13/3.14, runs Ruff, formatting,
 strict mypy and isolated pydoclint, then installs the built wheel and runs its
 tests. A configured workflow is not evidence that every matrix job has passed;
 consult the repository's Actions results for the revision being deployed.
+
+## Hosting
+
+`TcpServer` provides bounded TCP/mTLS admission, verified certificate URI identity,
+read/write deadlines and explicit draining/shutdown. Plain TCP requires an
+explicit local principal and a loopback bind address. `serve_granian` is an
+optional supervised HTTP host; install `grainlift-python[granian]`. It creates
+the worker inside one serving process and preserves ADBC session affinity.
+The existing `serve()` Waitress entry point remains available.
+
+```python
+from grainlift import Service, TcpServer, TLSConfig
+
+# Use the AnswerWorker defined below, or your own Worker implementation.
+tls = TLSConfig(
+    certificate="server.pem",
+    private_key="server-key.pem",
+    client_ca="clients-ca.pem",
+    principals={"spiffe://example.org/query-client": "analytics"},
+)
+with TcpServer(Service(AnswerWorker()), host="0.0.0.0", port=8443, tls=tls) as host:
+    shutdown_event.wait()  # Your process supervisor signals this event.
+```
+
+See [hosting and lifecycle configuration](docs/HOSTING.md) for a complete
+signal-handling example, Granian deployment, limits, credential rotation and
+the distinction between draining, forced transport shutdown and worker cleanup.
 
 See [grainlift-hello-world-python](https://github.com/Query-farm/grainlift-hello-world-python)
 for a complete worker and ordinary ADBC client.
@@ -123,6 +151,8 @@ Explicit result release, statement close/reuse, connection close, stream cancel,
 idle expiry, and Service.close() release resources. A broken HTTP connection
 does not necessarily mean the logical cursor is abandoned: idle expiry cleans up
 clients that disappear. Use Service as a context manager.
+The same rule applies to TCP: control and result sockets can belong to the same
+logical session, so closing one socket does not implicitly destroy that session.
 
 Parameter binding uses an anonymous Arrow IPC spool with a 64 MiB cumulative
 `Limits.bind_bytes` budget, including schema, dictionaries, and stream framing.
@@ -158,7 +188,8 @@ client-visible: never expose credentials through a backend getter.
 The CLI binds to loopback and requires a bearer token. For deployment, host
 Service.app(tokens={token: principal}) behind HTTPS and enforce process affinity.
 Do not expose plain HTTP with bearer tokens on an untrusted network.
-TCP, mTLS, and Iroh serving are not implemented or validated here.
+The supported TCP and mTLS hosts have explicit admission, I/O, and shutdown
+bounds; see [hosting](docs/HOSTING.md). Iroh serving is not implemented here.
 
 The WSGI wrapper filters VGI-RPC transport logs during Grainlift requests because
 diagnostics can contain SQL, credentials, Arrow values, and raw exceptions. It

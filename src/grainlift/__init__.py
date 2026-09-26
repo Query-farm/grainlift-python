@@ -4,8 +4,10 @@
 
 from .api import AdbcError, Connection, Limits, OptionValue, PartitionedResult, QueryResult, Statement, Worker
 from .credentials import TokenStore
+from .hosting import serve_granian
 from .isolation import IsolatedWorker
 from .server import Service, serve
+from .tcp import TcpLimits, TcpServer, TLSConfig
 
 __all__ = [
     "AdbcError",
@@ -18,6 +20,10 @@ __all__ = [
     "Service",
     "Statement",
     "TokenStore",
+    "TcpLimits",
+    "TcpServer",
+    "TLSConfig",
     "Worker",
     "serve",
+    "serve_granian",
 ]
