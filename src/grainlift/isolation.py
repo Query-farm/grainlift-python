@@ -92,8 +92,10 @@ def _option(value: OptionValue, limit: int) -> dict[str, Any]:
         return {"type": "string", "value": value}
     if type(value) is int and -(2**63) <= value < 2**63:
         return {"type": "int", "value": value}
-    if type(value) is float and math.isfinite(value):
-        return {"type": "double", "value": value}
+    if type(value) is float:
+        # Private pipe JSON carries exact IEEE 754 bits, including NaN payloads
+        # and signed zero, without introducing nonstandard JSON numeric values.
+        return {"type": "double_bits", "value": struct.pack(">d", value).hex()}
     raise AdbcError("Invalid isolated option value", "invalid_arguments")
 
 
@@ -105,13 +107,17 @@ def _option_value(value: Mapping[str, Any]) -> OptionValue:
         return raw
     if kind == "int" and type(raw) is int and -(2**63) <= raw < 2**63:
         return raw
-    if kind == "double" and type(raw) in (int, float) and math.isfinite(raw):
-        return float(raw)
+    if kind == "double_bits" and isinstance(raw, str) and len(raw) == 16:
+        try:
+            result: float = struct.unpack(">d", bytes.fromhex(raw))[0]
+            return result
+        except (ValueError, struct.error):
+            pass
     raise AdbcError("Invalid isolated option value", "invalid_data")
 
 
 def _row_count(value: int | None) -> None:
-    if value is not None and (type(value) is not int or not -(2**63) <= value < 2**63):
+    if value is not None and (type(value) is not int or not -1 <= value < 2**63):
         raise AdbcError("Invalid affected row count", "invalid_data")
 
 

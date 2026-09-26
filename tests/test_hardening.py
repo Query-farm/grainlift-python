@@ -12,6 +12,7 @@ from test_service import TestConnection, TestWorker, context, execute, open_sess
 from vgi_rpc import CallContext
 
 from grainlift import AdbcError, Limits, QueryResult, Service
+from grainlift.protocol import SetConnectionOptionRequest
 from grainlift.server import _Session
 
 
@@ -31,13 +32,15 @@ def test_duration_limits(field: str, bad: Any) -> None:
         Limits(**{field: bad})
 
 
-@pytest.mark.parametrize("encoded", ["", "{", "private malformed input"])
-def test_malformed_option_has_client_error(encoded: str) -> None:
-    """Verify malformed option has client error."""
+@pytest.mark.parametrize("value", [None, "private malformed input", 1])
+def test_malformed_option_has_client_error(value: Any) -> None:
+    """Reject an incorrectly typed option without echoing private input."""
     with Service(TestWorker()) as service:
         sid, ctx = open_session(service)
         with pytest.raises(AdbcError) as exc:
-            service.set_connection_option(sid, "adbc.connection.autocommit", encoded, ctx)
+            service.set_connection_option(
+                SetConnectionOptionRequest(session_id=sid, key="adbc.connection.autocommit", value=value), ctx
+            )
         assert exc.value.status == "invalid_arguments"
         assert "private malformed" not in str(exc.value)
 

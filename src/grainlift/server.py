@@ -4,11 +4,9 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import inspect
-import json
 import secrets
 import threading
 import time
@@ -16,7 +14,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, Concatenate, ParamSpec, TypeVar
+from typing import Concatenate, ParamSpec, TypeVar
 
 import falcon
 import pyarrow as pa
@@ -28,8 +26,10 @@ from . import protocol as p
 from .api import AdbcError, Connection, Limits, OptionValue, QueryResult, Statement, Worker
 from .binding import BindUpload, decode_batch, decode_schema
 from .credentials import TokenStore
-from .options import WireOptionValue, configured_options, decode_json, decode_options, decode_value, validate_key
+from .options import WireOptionValue, configured_options, option_mapping, validate_key
+from .requests import Request
 from .telemetry import PrivateApplication
+from .tokens import PartitionClaims, seal_partition, unseal_partition
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -42,7 +42,10 @@ def guarded[**P, T](method: Callable[Concatenate[Service, P], T]) -> Callable[Co
     @wraps(method)
     def call(self: Service, /, *args: P.args, **kwargs: P.kwargs) -> T:
         bound = signature.bind(self, *args, **kwargs)
-        sid = bound.arguments.get("session_id")
+        request = bound.arguments.get("request")
+        if request is not None:
+            self._request(request)
+        sid = getattr(request, "session_id", bound.arguments.get("session_id"))
         session = None
         with self._lock:
             if self._closed:
@@ -56,7 +59,7 @@ def guarded[**P, T](method: Callable[Concatenate[Service, P], T]) -> Callable[Co
                 assert sid is not None
                 self._session(sid, bound.arguments["ctx"])
                 with session.cancel_lock:
-                    statement_id = bound.arguments.get("statement_id")
+                    statement_id = getattr(request, "statement_id", bound.arguments.get("statement_id"))
                     if statement_id is None and "result_id" in bound.arguments:
                         statement_id = next(
                             (
@@ -326,9 +329,22 @@ class Service:
     def _schema_response(self, schema: pa.Schema) -> p.SchemaResponse:
         return self._response(p.SchemaResponse(schema_ipc=self._encoded_schema(schema)))
 
+    def _request(self, request: Request) -> None:
+        # Transport already enforces the HTTP body budget. Also enforce it for
+        # direct service calls before handle lookup, locking, or backend mutation.
+        if not isinstance(request, Request):
+            raise AdbcError("Expected a typed request", "invalid_arguments")
+        request.__post_init__()
+        encoded = request.serialize_to_bytes()
+        if len(encoded) > self.limits.request_bytes:
+            raise AdbcError("Request exceeds configured limit", "invalid_arguments")
+        envelope = pa.RecordBatch.from_pydict({"request": [encoded]}, schema=p.REQUEST_INPUT)
+        if len(serialize_record_batch_bytes(envelope)) > self.limits.request_bytes:
+            raise AdbcError("Request exceeds configured limit", "invalid_arguments")
+
     @staticmethod
     def _row_count(value: int | None) -> int | None:
-        if value is not None and (type(value) is not int or not -(2**63) <= value < 2**63):
+        if value is not None and (type(value) is not int or not -1 <= value < 2**63):
             raise AdbcError("Invalid affected row count", "invalid_data")
         return value
 
@@ -348,15 +364,13 @@ class Service:
         return response
 
     @guarded
-    def open_connection(
-        self, target: str, database_options_json: str, connection_options_json: str, ctx: CallContext
-    ) -> p.SessionResponse:
+    def open_connection(self, request: p.OpenConnectionRequest, ctx: CallContext) -> p.SessionResponse:
         """Authenticate and allocate a connection within the service quota."""
         principal = self._principal(ctx)
-        if target != self.worker.target:
+        if request.target != self.worker.target:
             raise AdbcError("Target is unavailable", "not_found")
-        database_options = decode_options(database_options_json, self.limits.request_bytes)
-        connection_options = decode_options(connection_options_json, self.limits.request_bytes)
+        database_options = option_mapping(request.database_options)
+        connection_options = option_mapping(request.connection_options)
         configured_keys = self._database_options.keys() | self._connection_options.keys()
         if database_options.keys() & configured_keys:
             raise AdbcError("Database option is configured by the server", "unauthorized")
@@ -445,8 +459,9 @@ class Service:
     @guarded
     def execute_schema(self, session_id: str, statement_id: str, ctx: CallContext) -> p.SchemaResponse:
         """Infer the result schema without opening a cursor."""
-        _, statement = self._statement(session_id, statement_id, ctx)
+        session, statement = self._statement(session_id, statement_id, ctx)
         self._require_complete_binding(statement)
+        self._discard_result(session, statement)
         return self._schema_response(statement.backend.execute_schema())
 
     @guarded
@@ -499,13 +514,13 @@ class Service:
         return self._response(p.OkResponse(ok=True))
 
     @guarded
-    def set_connection_option(self, session_id: str, key: str, value_json: str, ctx: CallContext) -> p.OkResponse:
+    def set_connection_option(self, request: p.SetConnectionOptionRequest, ctx: CallContext) -> p.OkResponse:
         """Set connection option when supported."""
-        session = self._session(session_id, ctx)
-        key = self._option_key(key)
+        session = self._session(request.session_id, ctx)
+        key = self._option_key(request.key)
         if key in self._database_options or key in self._connection_options:
             raise AdbcError("Connection option is configured by the server", "unauthorized")
-        session.connection.set_option(key, decode_value(decode_json(value_json, self.limits.request_bytes)))
+        session.connection.set_option(key, request.value.to_value())
         return self._response(p.OkResponse(ok=True))
 
     def _option_key(self, key: str) -> str:
@@ -565,18 +580,15 @@ class Service:
     @guarded
     def set_statement_option(
         self,
-        session_id: str,
-        statement_id: str,
-        key: str,
-        value_json: str,
+        request: p.SetStatementOptionRequest,
         ctx: CallContext,
     ) -> p.OkResponse:
         """Set a typed backend statement option, including ingestion configuration."""
-        _, statement = self._statement(session_id, statement_id, ctx)
-        key = self._option_key(key)
+        _, statement = self._statement(request.session_id, request.statement_id, ctx)
+        key = self._option_key(request.key)
         if key in self._database_options or key in self._connection_options:
             raise AdbcError("Statement option is configured by the server", "unauthorized")
-        statement.backend.set_option(key, decode_value(decode_json(value_json, self.limits.request_bytes)))
+        statement.backend.set_option(key, request.value.to_value())
         return self._response(p.OkResponse(ok=True))
 
     @guarded
@@ -647,31 +659,21 @@ class Service:
     def _seal_partition(self, descriptor: bytes, principal: str) -> bytes:
         if not isinstance(descriptor, bytes) or len(descriptor) > self.limits.batch_bytes:
             raise AdbcError("Partition descriptor exceeds configured limit", "invalid_data")
-        body = json.dumps(
-            [
-                time.time() + self.limits.idle_seconds,
-                self._partition_owner(principal),
-                base64.b64encode(descriptor).decode(),
-            ],
-            separators=(",", ":"),
-        ).encode()
-        return b"GLP1" + hmac.digest(self._partition_key, body, "sha256") + body
+        claims = PartitionClaims(
+            version=1,
+            expires_at_ms=int((time.time() + self.limits.idle_seconds) * 1000),
+            owner=self._partition_owner(principal),
+            descriptor=descriptor,
+        )
+        return seal_partition(claims, self._partition_key, self.limits.request_bytes)
 
     def _unseal_partition(self, payload: bytes, principal: str) -> bytes:
-        if len(payload) > self.limits.request_bytes:
-            raise AdbcError("Partition descriptor exceeds configured limit", "invalid_arguments")
-        if len(payload) < 36 or payload[:4] != b"GLP1":
+        claims = unseal_partition(payload, self._partition_key, self.limits.request_bytes)
+        if claims.expires_at_ms <= int(time.time() * 1000) or not hmac.compare_digest(
+            claims.owner, self._partition_owner(principal)
+        ):
             raise AdbcError("Partition descriptor is unavailable", "not_found")
-        signature, body = payload[4:36], payload[36:]
-        if not hmac.compare_digest(signature, hmac.digest(self._partition_key, body, "sha256")):
-            raise AdbcError("Partition descriptor is unavailable", "not_found")
-        try:
-            expires, owner, encoded = json.loads(body)
-            if expires < time.time() or not hmac.compare_digest(owner, self._partition_owner(principal)):
-                raise ValueError("Unavailable partition")
-            return base64.b64decode(encoded, validate=True)
-        except (ValueError, TypeError):
-            raise AdbcError("Partition descriptor is unavailable", "not_found") from None
+        return claims.descriptor
 
     @guarded
     def execute_partitions(self, session_id: str, statement_id: str, ctx: CallContext) -> p.PartitionsResponse:
@@ -704,65 +706,36 @@ class Service:
         self._ensure_result_slot(session)
         return self._register_result(session, session.connection.read_partition(descriptor))
 
-    def _arguments(self, args_json: str, allowed: set[str], required: set[str] | None = None) -> dict[str, Any]:
-        args = decode_json(args_json, self.limits.request_bytes)
-        if not isinstance(args, dict) or args.keys() - allowed or (required or set()) - args.keys():
-            raise AdbcError("Invalid metadata arguments", "invalid_arguments")
-        return args
-
-    @staticmethod
-    def _optional_string(args: dict[str, Any], name: str, required: bool = False) -> str | None:
-        value = args.get(name)
-        if (value is None and required) or (value is not None and not isinstance(value, str)):
-            raise AdbcError("Invalid metadata string argument", "invalid_arguments")
-        return value
-
     @guarded
-    def get_info(self, session_id: str, args_json: str, ctx: CallContext) -> p.ExecuteResponse:
+    def get_info(self, request: p.GetInfoRequest, ctx: CallContext) -> p.ExecuteResponse:
         """Read requested unsigned ADBC information codes as a bounded Arrow result."""
-        session = self._session(session_id, ctx)
-        args = self._arguments(args_json, {"codes"})
-        codes = args.get("codes")
-        if codes is not None and (
-            not isinstance(codes, list) or any(type(code) is not int or not 0 <= code < 2**32 for code in codes)
-        ):
-            raise AdbcError("Invalid information codes", "invalid_arguments")
+        session = self._session(request.session_id, ctx)
         self._ensure_result_slot(session)
-        return self._register_result(session, session.connection.get_info(codes))
+        return self._register_result(session, session.connection.get_info(request.codes))
 
     @guarded
-    def get_objects(self, session_id: str, args_json: str, ctx: CallContext) -> p.ExecuteResponse:
+    def get_objects(self, request: p.GetObjectsRequest, ctx: CallContext) -> p.ExecuteResponse:
         """Read the backend's hierarchical object metadata and preserve its filters."""
-        session = self._session(session_id, ctx)
-        args = self._arguments(
-            args_json, {"depth", "catalog", "db_schema", "table_name", "table_type", "column_name"}, {"depth"}
-        )
-        depth, table_types = args["depth"], args.get("table_type")
-        if type(depth) is not int or depth not in {0, 1, 2, 3}:
-            raise AdbcError("Invalid object depth", "invalid_arguments")
-        if table_types is not None and (
-            not isinstance(table_types, list) or any(not isinstance(value, str) for value in table_types)
-        ):
-            raise AdbcError("Invalid table type filter", "invalid_arguments")
-        catalog, db_schema, table_name, column_name = (
-            self._optional_string(args, name) for name in ("catalog", "db_schema", "table_name", "column_name")
-        )
+        session = self._session(request.session_id, ctx)
         self._ensure_result_slot(session)
         return self._register_result(
-            session, session.connection.get_objects(depth, catalog, db_schema, table_name, table_types, column_name)
+            session,
+            session.connection.get_objects(
+                request.depth,
+                request.catalog,
+                request.db_schema,
+                request.table_name,
+                request.table_types,
+                request.column_name,
+            ),
         )
 
     @guarded
-    def get_table_schema(self, session_id: str, args_json: str, ctx: CallContext) -> p.SchemaResponse:
+    def get_table_schema(self, request: p.GetTableSchemaRequest, ctx: CallContext) -> p.SchemaResponse:
         """Read a table schema after validating the metadata filter arguments."""
-        session = self._session(session_id, ctx)
-        args = self._arguments(args_json, {"catalog", "db_schema", "table_name"}, {"table_name"})
-        table_name = self._optional_string(args, "table_name", required=True)
-        assert table_name is not None
+        session = self._session(request.session_id, ctx)
         return self._schema_response(
-            session.connection.get_table_schema(
-                self._optional_string(args, "catalog"), self._optional_string(args, "db_schema"), table_name
-            )
+            session.connection.get_table_schema(request.catalog, request.db_schema, request.table_name)
         )
 
     @guarded
@@ -780,19 +753,15 @@ class Service:
         return self._register_result(session, session.connection.get_statistic_names())
 
     @guarded
-    def get_statistics(self, session_id: str, args_json: str, ctx: CallContext) -> p.ExecuteResponse:
+    def get_statistics(self, request: p.GetStatisticsRequest, ctx: CallContext) -> p.ExecuteResponse:
         """Read backend statistics with exact or approximate semantics preserved."""
-        session = self._session(session_id, ctx)
-        args = self._arguments(args_json, {"catalog", "db_schema", "table_name", "approximate"}, {"approximate"})
-        approximate = args["approximate"]
-        if type(approximate) is not bool:
-            raise AdbcError("Invalid approximation flag", "invalid_arguments")
-        catalog, db_schema, table_name = (
-            self._optional_string(args, name) for name in ("catalog", "db_schema", "table_name")
-        )
+        session = self._session(request.session_id, ctx)
         self._ensure_result_slot(session)
         return self._register_result(
-            session, session.connection.get_statistics(catalog, db_schema, table_name, approximate)
+            session,
+            session.connection.get_statistics(
+                request.catalog, request.db_schema, request.table_name, request.approximate
+            ),
         )
 
     def _start_binding(

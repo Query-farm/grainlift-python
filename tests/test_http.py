@@ -23,7 +23,7 @@ from waitress.adjustments import Adjustments
 from waitress.parser import HTTPRequestParser
 
 from grainlift import Limits, Service, serve
-from grainlift.protocol import BIND_INPUT, Grainlift, schema_ipc
+from grainlift.protocol import BIND_INPUT, Grainlift, OpenConnectionRequest, schema_ipc
 
 
 @pytest.mark.parametrize(
@@ -44,7 +44,7 @@ def test_stock_http_binding_preserves_empty_shapes_and_dictionaries(batch: pa.Re
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # Protocol reflection.
             sid = rpc.open_connection(
-                target="default", database_options_json="[]", connection_options_json="[]"
+                request=OpenConnectionRequest(target="default", database_options=[], connection_options=[])
             ).session_id
             stmt = rpc.new_statement(session_id=sid).statement_id
             with rpc.bind_stream(session_id=sid, statement_id=stmt, schema_ipc=schema_ipc(batch.schema)) as stream:
@@ -71,7 +71,7 @@ def test_continuation_checks_principal() -> None:
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # VGI reflects the protocol class.
             sid = rpc.open_connection(
-                target="default", database_options_json="[]", connection_options_json="[]"
+                request=OpenConnectionRequest(target="default", database_options=[], connection_options=[])
             ).session_id
             stmt = rpc.new_statement(session_id=sid).statement_id
             rpc.set_sql_query(session_id=sid, statement_id=stmt, sql="query")
@@ -95,7 +95,7 @@ def test_unsupported_bind_has_adbc_error() -> None:
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # VGI reflects the protocol class.
             sid = rpc.open_connection(
-                target="default", database_options_json="[]", connection_options_json="[]"
+                request=OpenConnectionRequest(target="default", database_options=[], connection_options=[])
             ).session_id
             stmt = rpc.new_statement(session_id=sid).statement_id
             with (
@@ -143,7 +143,9 @@ def test_transport_logs_are_suppressed(caplog: pytest.LogCaptureFixture) -> None
         )
         assert (logger.disabled, logger.level, logger.propagate, list(logger.handlers)) == before
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # VGI reflects the protocol class.
-            rpc.open_connection(target="default", database_options_json="[]", connection_options_json="[]")
+            rpc.open_connection(
+                request=OpenConnectionRequest(target="default", database_options=[], connection_options=[])
+            )
         assert "SECRET" not in caplog.text
         logger.error("unrelated application remains observable")
         assert "unrelated application remains observable" in caplog.text
@@ -162,7 +164,7 @@ def test_isolated_worker_through_wsgi() -> None:
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # VGI reflects the protocol class.
             sid = rpc.open_connection(
-                target="default", database_options_json="[]", connection_options_json="[]"
+                request=OpenConnectionRequest(target="default", database_options=[], connection_options=[])
             ).session_id
             stmt = rpc.new_statement(session_id=sid).statement_id
             rpc.set_sql_query(session_id=sid, statement_id=stmt, sql="ok")
@@ -205,7 +207,9 @@ def test_private_handler_filters_refresh_between_requests(monkeypatch: pytest.Mo
             default_headers={"Authorization": "Bearer token"},
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # Reflect the protocol class.
-            rpc.open_connection(target="default", database_options_json="[]", connection_options_json="[]")
+            rpc.open_connection(
+                request=OpenConnectionRequest(target="default", database_options=[], connection_options=[])
+            )
         assert not records
         logging.getLogger("vgi_rpc.refresh_parent.new_child").error("public")
         assert [record.getMessage() for record in records] == ["public"]
@@ -219,7 +223,7 @@ def test_http_request_limit(headroom: int) -> None:
         buf,
         "open_connection",
         rpc_methods(Grainlift)["open_connection"].params_schema,
-        {"target": "default", "database_options_json": "[]", "connection_options_json": "[]"},
+        {"request": OpenConnectionRequest(target="default", database_options=[], connection_options=[])},
         protocol=Grainlift.protocol_name,
         protocol_version=Grainlift.protocol_version,
     )
@@ -246,7 +250,7 @@ def test_serve_preserves_inclusive_content_length_limit(monkeypatch: pytest.Monk
         buf,
         "open_connection",
         rpc_methods(Grainlift)["open_connection"].params_schema,
-        {"target": "default", "database_options_json": "[]", "connection_options_json": "[]"},
+        {"request": OpenConnectionRequest(target="default", database_options=[], connection_options=[])},
         protocol=Grainlift.protocol_name,
         protocol_version=Grainlift.protocol_version,
     )

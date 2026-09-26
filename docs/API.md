@@ -57,10 +57,10 @@ connection closure.
 `OptionValue` is `str | bytes | int | float`. Option responses contain
 `WireOptionValue`, a nested Arrow record with a `kind` discriminator and exactly
 one non-null field: `string_value`, `bytes_value`, `int_value` (signed 64-bit), or
-`double_value` (finite). Bytes remain native binary. Option requests retain their
-existing tagged JSON representation, including base64 for bytes. Explicit get-option type
+`double_value` (IEEE 754 float64, including NaN and infinities). Bytes remain native binary in both requests and responses.
+Opening requests contain lists of `NamedOption(key, value)` records. Explicit get-option type
 mismatches are errors, not coercions. Opening option lists reject duplicate
-keys and malformed JSON; configured server keys cannot be shadowed across the
+keys and null list items; configured server keys cannot be shadowed across the
 database and connection scopes. The service copies configuration mappings so
 later mutation of the caller's mapping does not change authority.
 
@@ -108,7 +108,7 @@ only the chosen engine determines which plans it supports.
 | Statements per session | 32 |
 | Live query/metadata/partition result handles per session | 32 |
 | Referenced Arrow buffers per batch / schema descriptor bytes | 1 MiB each |
-| HTTP request body / Substrait input / typed option input JSON | 2 MiB each |
+| HTTP request body / Substrait input / complete typed request envelope | 2 MiB each |
 | Unary response, including nested IPC and outer result envelope | 1 MiB |
 | SQL UTF-8 bytes | 64 KiB |
 | Complete Arrow IPC parameter spool | 64 MiB |
@@ -122,9 +122,9 @@ message, 32 child statements, 32 child results, and 64 MiB per binding spool.
 These transport and handle limits cannot prevent arbitrary allocations inside
 trusted worker code; apply OS/container memory and CPU limits.
 
-## Typed wire responses
+## Typed control records
 
-Protocol `org.queryfarm.Grainlift.v1`, version `0.3.0`, uses stock VGI-RPC
+Protocol `org.queryfarm.Grainlift.v1`, version `0.4.0`, uses stock VGI-RPC
 `ArrowSerializableDataclass` returns. `grainlift.protocol` defines frozen,
 keyword-only `OkResponse`, `SessionResponse`, `StatementResponse`,
 `ExecuteResponse`, `SchemaResponse`, `ValueResponse`, `UpdateResponse`, and
@@ -132,15 +132,62 @@ keyword-only `OkResponse`, `SessionResponse`, `StatementResponse`,
 each object's single-row IPC stream in its standard non-null `result: binary`
 column; query result streams still carry ordinary pull-based Arrow batches.
 
+Seven methods accept exactly one named `request` record through VGI's standard
+non-null `request: binary` envelope. Their classes are exported from
+`grainlift.protocol`; service calls add `ctx` after the request. Existing simple
+operations, such as committing a session or executing a statement, retain their
+primitive handle parameters.
+
+| Method | Request record | Fields beyond the owning session handle |
+| --- | --- | --- |
+| `open_connection` | `OpenConnectionRequest` | `target`, `database_options`, `connection_options`; no session exists yet |
+| `set_connection_option` | `SetConnectionOptionRequest` | `key`, `value` |
+| `set_statement_option` | `SetStatementOptionRequest` | `statement_id`, `key`, `value` |
+| `get_info` | `GetInfoRequest` | `codes` |
+| `get_objects` | `GetObjectsRequest` | `depth`, `catalog`, `db_schema`, `table_name`, `table_types`, `column_name` |
+| `get_table_schema` | `GetTableSchemaRequest` | `catalog`, `db_schema`, `table_name` |
+| `get_statistics` | `GetStatisticsRequest` | `catalog`, `db_schema`, `table_name`, `approximate` |
+
+`GetInfoRequest.codes` carries unsigned 32-bit ADBC codes in Arrow int64 values;
+null requests all supported codes, while an empty list remains empty. Discovery
+filters preserve null, empty strings, empty lists, and search patterns. Object
+depths are 0 (all), 1 (catalogs), 2 (schemas), and 3 (tables). Table schema lookup
+uses exact names. The toolkit forwards these distinctions to the backend; the
+backend supplies conforming metadata schemas and values.
+
+Control payloads require exactly one complete, uncompressed, single-row Arrow
+IPC batch and the exact versioned schema, including field names, order, types,
+and nullability. Null list children, extra or missing fields, trailing bytes,
+and additional batches are rejected. Python constructor defaults are convenient
+locally; the serialized wire record still includes every declared field.
+Session ownership is checked from the named request before backend dispatch.
+
 Response size checks include the nested schema and record batch plus the outer
 IPC envelope. Result handles are registered only after this validation succeeds;
 oversized metadata responses close their backend cursors. `schema_ipc` fields
 retain Grainlift's unframed FlatBuffer schema-message format. Bind acknowledgements
-remain a raw non-null `ok: bool` batch. Method names and request primitives remain
-unchanged, but the response and binding formats are incompatible with protocol
-0.2.0; upgrade clients and servers together.
+remain a raw non-null `ok: bool` batch. Existing method names remain unchanged,
+but control schemas are incompatible with earlier protocol minors; upgrade
+clients and servers together.
 
-Focused regression coverage lives in `tests/test_unary_features.py`,
+Partition descriptors remain opaque to ADBC applications. The Python service's
+`GLP2` wrapper authenticates a typed `PartitionClaims` record containing a claims
+version, expiry in Unix milliseconds, owner binding, and native binary backend
+descriptor. Signature verification precedes Arrow decoding. The complete token
+is bounded; signed claims must also match the expected schema and supported
+version. A token expires at its deadline and remains tied to its issuing
+service, target, and principal.
+
+For driver extensions, add new namespaced option keys or vendor information
+codes without changing existing meanings. A new control field, option value
+kind, or method requires an explicit protocol compatibility decision and
+matching client/server schema tests; unknown fields are not silently ignored.
+The wire contract transports capabilities while backend hooks determine actual
+ADBC support. Unsupported operations should return `NOT_IMPLEMENTED` rather
+than approximate database behavior.
+
+Focused regression coverage lives in `tests/test_typed_requests.py`,
+`tests/test_typed_responses.py`, `tests/test_partition_claims.py`, `tests/test_unary_features.py`,
 `tests/test_binding.py`, `tests/test_binding_service.py`, and
 `tests/test_isolation_features.py`, with additional ownership, HTTP, lifecycle,
 and process-failure tests in the original toolkit suite. The Grainlift native

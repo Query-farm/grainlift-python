@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-import json
+import struct
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -26,12 +26,34 @@ from grainlift import (
     Statement,
     Worker,
 )
-from grainlift.options import WireOptionValue, decode_options, encode_value
-from grainlift.protocol import UNARY_OUTPUT, ValueResponse, schema_ipc
+from grainlift.options import NamedOption, WireOptionValue
+from grainlift.protocol import (
+    UNARY_OUTPUT,
+    GetInfoRequest,
+    GetObjectsRequest,
+    GetStatisticsRequest,
+    GetTableSchemaRequest,
+    OpenConnectionRequest,
+    SetConnectionOptionRequest,
+    SetStatementOptionRequest,
+    ValueResponse,
+    schema_ipc,
+)
 
 
 def _wire_size(response: ArrowSerializableDataclass) -> int:
     envelope = pa.RecordBatch.from_pydict({"result": [response.serialize_to_bytes()]}, schema=UNARY_OUTPUT)
+    return len(serialize_record_batch_bytes(envelope))
+
+
+def _option(value: OptionValue) -> WireOptionValue:
+    kind = {str: "string", bytes: "bytes", int: "int", float: "double"}[type(value)]
+    return WireOptionValue.from_value(value, kind)
+
+
+def _request_size(request: ArrowSerializableDataclass) -> int:
+    schema = pa.schema([pa.field("request", pa.binary(), nullable=False)])
+    envelope = pa.RecordBatch.from_pydict({"request": [request.serialize_to_bytes()]}, schema=schema)
     return len(serialize_record_batch_bytes(envelope))
 
 
@@ -205,14 +227,16 @@ class FeatureWorker(Worker):
 @pytest.mark.parametrize("option", ["text", b"\x00\xff", -(2**63), 2**63 - 1, 1.25])
 def test_typed_connection_and_statement_option_roundtrip(option: OptionValue) -> None:
     """Preserve all four ADBC option representations through their exact wire codec."""
-    encoded = json.dumps(encode_value(option))
+    encoded = _option(option)
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
         stmt = service.new_statement(sid, ctx).statement_id
-        service.set_connection_option(sid, "setting", encoded, ctx)
-        service.set_statement_option(sid, stmt, "setting", encoded, ctx)
-        kind = str(encode_value(option)["type"])
+        service.set_connection_option(SetConnectionOptionRequest(session_id=sid, key="setting", value=encoded), ctx)
+        service.set_statement_option(
+            SetStatementOptionRequest(session_id=sid, statement_id=stmt, key="setting", value=encoded), ctx
+        )
+        kind = encoded.kind
         for response in (
             service.get_connection_option(sid, "setting", kind, ctx),
             service.get_statement_option(sid, stmt, "setting", kind, ctx),
@@ -222,36 +246,36 @@ def test_typed_connection_and_statement_option_roundtrip(option: OptionValue) ->
 
 
 @pytest.mark.parametrize(
-    "encoded",
+    "key",
     [
-        "{}",
-        "null",
-        '[{"key":"x","type":"int","value":true}]',
-        '[{"key":"x","type":"int","value":9223372036854775808}]',
-        '[{"key":"x","type":"double","value":NaN}]',
-        '[{"key":"x","type":"bytes","value":"%%%"}]',
-        '[{"key":"x","type":"string","value":null}]',
-        '[{"key":"x","type":"string","value":"x","extra":1}]',
-        '[{"key":"x","key":"y","type":"int","value":1}]',
-        '[{"key":"x","type":"int","value":1},{"key":"x","type":"int","value":2}]',
+        "",
+        "bad\0key",
+        None,
+        5,
     ],
 )
-def test_invalid_option_wire_rejected(encoded: str) -> None:
-    """Reject malformed or ambiguous typed options before a backend callback."""
+def test_invalid_named_option_key_rejected(key: Any) -> None:
+    """Reject malformed named option keys before a backend callback."""
     with pytest.raises(AdbcError) as exc:
-        decode_options(encoded, 4096)
+        NamedOption(key=key, value=_option(1))
     assert exc.value.status == "invalid_arguments"
 
 
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
 def test_option_input_size_boundary(headroom: int) -> None:
-    """Apply an inclusive byte budget to named option JSON."""
-    encoded = '[{"key":"x","type":"bytes","value":"AP8="}]'
-    if headroom < 0:
-        with pytest.raises(AdbcError, match="exceeds"):
-            decode_options(encoded, len(encoded) + headroom)
-    else:
-        assert decode_options(encoded, len(encoded) + headroom) == {"x": b"\0\xff"}
+    """Apply an inclusive byte budget to the complete typed opening request."""
+    request = OpenConnectionRequest(
+        target="default", database_options=[], connection_options=[NamedOption(key="x", value=_option(b"\0\xff"))]
+    )
+    worker = FeatureWorker()
+    with Service(worker, limits=Limits(request_bytes=_request_size(request) + headroom)) as service:
+        if headroom < 0:
+            with pytest.raises(AdbcError, match="exceeds"):
+                service.open_connection(request, context(service))
+            assert not worker.connections
+        else:
+            service.open_connection(request, context(service))
+            assert worker.connections[0].options == {"x": b"\0\xff"}
 
 
 def test_default_open_connection_closes_after_failed_option() -> None:
@@ -259,7 +283,14 @@ def test_default_open_connection_closes_after_failed_option() -> None:
     worker = FeatureWorker()
     with Service(worker) as service:
         with pytest.raises(AdbcError, match="HY024|Rejected option"):
-            service.open_connection("default", "[]", '[{"key":"fail","type":"int","value":1}]', context(service))
+            service.open_connection(
+                OpenConnectionRequest(
+                    target="default",
+                    database_options=[],
+                    connection_options=[NamedOption(key="fail", value=_option(1))],
+                ),
+                context(service),
+            )
         assert worker.connections[0].closed
         assert service._opening == 0 and not service._sessions
 
@@ -286,10 +317,15 @@ def test_server_options_authoritative_across_open_and_mutation() -> None:
     ) as service:
         ctx = context(service)
         for key in ("uri", "role"):
-            supplied = json.dumps([{"key": key, "type": "string", "value": "injected"}])
-            for database, connection in ((supplied, "[]"), ("[]", supplied)):
+            supplied = [NamedOption(key=key, value=_option("injected"))]
+            for database, connection in ((supplied, []), ([], supplied)):
                 with pytest.raises(AdbcError) as exc:
-                    service.open_connection("default", database, connection, ctx)
+                    service.open_connection(
+                        OpenConnectionRequest(
+                            target="default", database_options=database, connection_options=connection
+                        ),
+                        ctx,
+                    )
                 assert exc.value.status == "unauthorized"
         assert not worker.connections
         sid, ctx = open_session(service)
@@ -297,10 +333,15 @@ def test_server_options_authoritative_across_open_and_mutation() -> None:
         stmt = service.new_statement(sid, ctx).statement_id
         for key in ("uri", "role"):
             with pytest.raises(AdbcError) as exc:
-                service.set_connection_option(sid, key, '{"type":"string","value":"injected"}', ctx)
+                service.set_connection_option(
+                    SetConnectionOptionRequest(session_id=sid, key=key, value=_option("injected")), ctx
+                )
             assert exc.value.status == "unauthorized"
             with pytest.raises(AdbcError) as exc:
-                service.set_statement_option(sid, stmt, key, '{"type":"string","value":"injected"}', ctx)
+                service.set_statement_option(
+                    SetStatementOptionRequest(session_id=sid, statement_id=stmt, key=key, value=_option("injected")),
+                    ctx,
+                )
             assert exc.value.status == "unauthorized"
         assert not worker.connections[0].statements[0].options
         visible = service.get_connection_option(sid, "role", "string", ctx)
@@ -338,9 +379,12 @@ def test_metadata_filters_and_result_quota() -> None:
     worker = FeatureWorker()
     with Service(worker, limits=Limits(results_per_session=2)) as service:
         sid, ctx = open_session(service)
-        first = service.get_info(sid, '{"codes":[0,4294967295]}', ctx)
+        first = service.get_info(GetInfoRequest(session_id=sid, codes=[0, 4294967295]), ctx)
         service.get_objects(
-            sid, '{"depth":0,"catalog":"","db_schema":null,"table_name":"x%","table_type":[],"column_name":"_%"}', ctx
+            GetObjectsRequest(
+                session_id=sid, depth=0, catalog="", db_schema=None, table_name="x%", table_types=[], column_name="_%"
+            ),
+            ctx,
         )
         backend = worker.connections[0]
         assert backend.calls == [("info", [0, 4294967295]), ("objects", (0, "", None, "x%", [], "_%"))]
@@ -354,14 +398,14 @@ def test_metadata_filters_and_result_quota() -> None:
         assert all(reader.closed for reader in backend.readers)
 
 
-@pytest.mark.parametrize("args", ['{"codes":[true]}', '{"codes":[-1]}', '{"codes":[4294967296]}', '{"unknown":1}'])
-def test_invalid_metadata_arguments_do_not_reach_worker(args: str) -> None:
-    """Reject invalid information codes and unknown argument names before execution."""
+@pytest.mark.parametrize("codes", [[True], [-1], [4294967296], ["unknown"], [None], "not a list"])
+def test_invalid_metadata_arguments_do_not_reach_worker(codes: Any) -> None:
+    """Reject invalid information codes before execution."""
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
         with pytest.raises(AdbcError) as exc:
-            service.get_info(sid, args, ctx)
+            service.get_info(GetInfoRequest(session_id=sid, codes=codes), ctx)
         assert exc.value.status == "invalid_arguments"
         assert not worker.connections[0].calls
 
@@ -410,7 +454,7 @@ def test_partition_count_boundary(count: int) -> None:
             assert len(response.partitions) == count
 
 
-@pytest.mark.parametrize("bad", [True, 2**63, float("nan")])
+@pytest.mark.parametrize("bad", [True, -2, 2**63, float("nan")])
 def test_invalid_backend_update_counts_rejected(bad: Any) -> None:
     """Reject invalid affected-row counts without allowing Arrow coercions."""
     worker = FeatureWorker()
@@ -423,11 +467,30 @@ def test_invalid_backend_update_counts_rejected(bad: Any) -> None:
         assert exc.value.status == "invalid_data"
 
 
+@pytest.mark.parametrize("option", [float("nan"), float("inf"), float("-inf"), -0.0])
+def test_double_options_preserve_ieee754_through_service(option: float) -> None:
+    """Forward every ADBC double representation through connection and statement hooks."""
+    with Service(FeatureWorker()) as service:
+        sid, ctx = open_session(service)
+        stmt = service.new_statement(sid, ctx).statement_id
+        value = WireOptionValue.from_value(option, "double")
+        service.set_connection_option(SetConnectionOptionRequest(session_id=sid, key="x", value=value), ctx)
+        service.set_statement_option(
+            SetStatementOptionRequest(session_id=sid, statement_id=stmt, key="x", value=value), ctx
+        )
+        for response in (
+            service.get_connection_option(sid, "x", "double", ctx),
+            service.get_statement_option(sid, stmt, "x", "double", ctx),
+        ):
+            decoded = response.value.to_value()
+            assert type(decoded) is float and struct.pack("!d", decoded) == struct.pack("!d", option)
+
+
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
 @pytest.mark.parametrize("option", [b"x" * 8, "é🌾"])
 def test_typed_option_output_boundary(headroom: int, option: OptionValue) -> None:
     """Bound the typed option response including nested IPC and envelope overhead."""
-    kind = str(encode_value(option)["type"])
+    kind = _option(option).kind
     budget = _wire_size(ValueResponse(value=WireOptionValue.from_value(option, kind))) + headroom
     worker = FeatureWorker()
     with Service(worker, limits=Limits(batch_bytes=budget)) as service:
@@ -443,17 +506,18 @@ def test_typed_option_output_boundary(headroom: int, option: OptionValue) -> Non
 
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
 def test_unicode_option_input_uses_utf8_byte_limit(headroom: int) -> None:
-    """Count encoded UTF-8 bytes instead of Unicode characters before backend delegation."""
-    encoded = json.dumps({"type": "string", "value": "é🌾"}, ensure_ascii=False)
+    """Count actual Arrow UTF-8 bytes and framing before backend delegation."""
     worker = FeatureWorker()
-    with Service(worker, limits=Limits(request_bytes=len(encoded.encode()) + headroom)) as service:
+    with Service(worker) as service:
         sid, ctx = open_session(service)
+        request = SetConnectionOptionRequest(session_id=sid, key="text", value=_option("é🌾"))
+        service.limits = replace(service.limits, request_bytes=_request_size(request) + headroom)
         if headroom < 0:
             with pytest.raises(AdbcError, match="exceeds"):
-                service.set_connection_option(sid, "text", encoded, ctx)
+                service.set_connection_option(request, ctx)
             assert not worker.connections[0].options
         else:
-            service.set_connection_option(sid, "text", encoded, ctx)
+            service.set_connection_option(request, ctx)
             assert worker.connections[0].options == {"text": "é🌾"}
 
 
@@ -461,9 +525,10 @@ def test_unicode_option_input_uses_utf8_byte_limit(headroom: int) -> None:
 def test_substrait_input_boundary(size: int) -> None:
     """Reject over-budget plans before invoking the backend setter."""
     worker = FeatureWorker()
-    with Service(worker, limits=Limits(request_bytes=16)) as service:
+    with Service(worker) as service:
         sid, ctx = open_session(service)
         stmt = service.new_statement(sid, ctx).statement_id
+        service.limits = replace(service.limits, request_bytes=16)
         if size > 16:
             with pytest.raises(AdbcError, match="exceeds"):
                 service.set_substrait_plan(sid, stmt, b"x" * size, ctx)
@@ -497,12 +562,15 @@ def test_statistics_and_table_discovery_preserve_arguments() -> None:
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
-        service.get_table_schema(sid, '{"catalog":"","db_schema":null,"table_name":"target"}', ctx)
+        service.get_table_schema(
+            GetTableSchemaRequest(session_id=sid, catalog="", db_schema=None, table_name="target"), ctx
+        )
         service.get_table_types(sid, ctx)
         for approximate in (True, False):
             service.get_statistics(
-                sid,
-                json.dumps({"catalog": "c%", "db_schema": "s_", "table_name": None, "approximate": approximate}),
+                GetStatisticsRequest(
+                    session_id=sid, catalog="c%", db_schema="s_", table_name=None, approximate=approximate
+                ),
                 ctx,
             )
         assert worker.connections[0].calls == [

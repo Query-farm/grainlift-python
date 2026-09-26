@@ -1,16 +1,13 @@
 # Copyright (c) 2026 Query Farm LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Typed option responses and bounded JSON request codecs for ADBC options."""
+"""Typed ADBC option records and bounded server configuration codecs."""
 
 from __future__ import annotations
 
 import base64
-import binascii
 import json
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 from vgi_rpc.utils import ArrowSerializableDataclass
 
@@ -26,7 +23,7 @@ class WireOptionValue(ArrowSerializableDataclass):
         string_value: String payload, set only for the string kind.
         bytes_value: Binary payload, set only for the bytes kind.
         int_value: Signed 64-bit payload, set only for the int kind.
-        double_value: Finite floating-point payload, set only for the double kind.
+        double_value: IEEE 754 float64 payload, set only for the double kind.
     """
 
     kind: str
@@ -68,27 +65,39 @@ class WireOptionValue(ArrowSerializableDataclass):
         raise AdbcError("Invalid typed option payload", "invalid_data")
 
 
-def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("Duplicate JSON field")
-        result[key] = value
+@dataclass(frozen=True, kw_only=True)
+class NamedOption(ArrowSerializableDataclass):
+    """Associate an extensible driver option key with exactly one typed value.
+
+    Attributes:
+        key: Nonempty driver-defined option name without NUL characters.
+        value: Binary, string, signed integer or double option value.
+    """
+
+    key: str
+    value: WireOptionValue
+
+    def __post_init__(self) -> None:
+        """Validate option names and payload types before dispatch."""
+        validate_key(self.key)
+        if not isinstance(self.value, WireOptionValue):
+            raise AdbcError("Invalid named option value", "invalid_arguments")
+        self.value.__post_init__()
+
+
+def option_mapping(options: list[NamedOption]) -> dict[str, OptionValue]:
+    """Validate typed option lists without dropping duplicates or coercing values."""
+    if not isinstance(options, list):
+        raise AdbcError("Options must be a typed list", "invalid_arguments")
+    result: dict[str, OptionValue] = {}
+    for option in options:
+        if not isinstance(option, NamedOption):
+            raise AdbcError("Invalid named option", "invalid_arguments")
+        option.__post_init__()
+        if option.key in result:
+            raise AdbcError("Duplicate option key", "invalid_arguments")
+        result[option.key] = option.value.to_value()
     return result
-
-
-def decode_json(encoded: str, limit: int) -> Any:
-    """Parse bounded input JSON and reject duplicate object fields or nonfinite numbers."""
-    if len(encoded.encode("utf-8")) > limit:
-        raise AdbcError("JSON input exceeds configured limit", "invalid_arguments")
-    try:
-        return json.loads(encoded, object_pairs_hook=_object, parse_constant=_reject_constant)
-    except (ValueError, TypeError, RecursionError):
-        raise AdbcError("Invalid JSON arguments", "invalid_arguments") from None
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError("Nonfinite JSON number")
 
 
 def validate_key(key: object) -> str:
@@ -98,30 +107,6 @@ def validate_key(key: object) -> str:
     return key
 
 
-def decode_value(value: object) -> OptionValue:
-    """Decode a strict tagged option value without implicit boolean or numeric coercion."""
-    if not isinstance(value, dict) or set(value) != {"type", "value"}:
-        raise AdbcError("Invalid option value", "invalid_arguments")
-    kind, raw = value["type"], value["value"]
-    if kind == "string" and type(raw) is str:
-        return raw
-    if kind == "int" and type(raw) is int and -(2**63) <= raw < 2**63:
-        return raw
-    if kind == "double" and type(raw) in (int, float):
-        try:
-            number = float(raw)
-            if math.isfinite(number):
-                return number
-        except OverflowError:
-            pass
-    if kind == "bytes" and type(raw) is str:
-        try:
-            return base64.b64decode(raw, validate=True)
-        except (ValueError, binascii.Error):
-            pass
-    raise AdbcError("Invalid option type or value", "invalid_arguments")
-
-
 def _validate_value(value: OptionValue, value_type: str | None = None) -> str:
     kinds = {str: "string", bytes: "bytes", int: "int", float: "double"}
     kind = kinds.get(type(value))
@@ -129,31 +114,13 @@ def _validate_value(value: OptionValue, value_type: str | None = None) -> str:
         raise AdbcError("Backend returned an incompatible option type", "invalid_data")
     if type(value) is int and not -(2**63) <= value < 2**63:
         raise AdbcError("Backend integer option is out of range", "invalid_data")
-    if type(value) is float and not math.isfinite(value):
-        raise AdbcError("Backend double option is not finite", "invalid_data")
     return kind
 
 
 def encode_value(value: OptionValue, value_type: str | None = None) -> dict[str, object]:
-    """Encode an option request while enforcing exact type and finite numeric ranges."""
+    """Measure server configuration using its stable local JSON representation."""
     kind = _validate_value(value, value_type)
     return {"type": kind, "value": base64.b64encode(value).decode("ascii") if isinstance(value, bytes) else value}
-
-
-def decode_options(encoded: str, limit: int) -> dict[str, OptionValue]:
-    """Decode the wire list of named options, rejecting duplicate option keys."""
-    raw = decode_json(encoded, limit)
-    if not isinstance(raw, list):
-        raise AdbcError("Options must be a list", "invalid_arguments")
-    result: dict[str, OptionValue] = {}
-    for item in raw:
-        if not isinstance(item, dict) or set(item) != {"key", "type", "value"}:
-            raise AdbcError("Invalid named option", "invalid_arguments")
-        key = validate_key(item["key"])
-        if key in result:
-            raise AdbcError("Duplicate option key", "invalid_arguments")
-        result[key] = decode_value({"type": item["type"], "value": item["value"]})
-    return result
 
 
 def configured_options(options: Mapping[str, OptionValue] | None, limit: int) -> dict[str, OptionValue]:

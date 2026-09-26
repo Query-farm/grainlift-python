@@ -4,7 +4,7 @@ Build ADBC services in Python. Applications load the existing native Grainlift
 ADBC driver; your worker supplies query behavior and lazy Arrow batches over
 VGI-RPC. No downstream ADBC driver is required.
 
-The toolkit exposes the Grainlift protocol 0.3.0 ADBC operation surface over HTTP:
+The toolkit exposes the Grainlift protocol 0.4.0 ADBC operation surface over HTTP:
 transactions, statements, preparation, typed options, parameter batches and
 streams, updates and ingestion, metadata, partitioned results, and Substrait
 plans. Your backend implements each capability through `Connection` and
@@ -28,10 +28,12 @@ and run:
 The toolkit uses published `vgi-rpc[http]>=0.47.1`; the lockfile pins its index
 release and dependencies. No modified VGI runtime is required. Unary service
 methods return frozen typed response dataclasses, which VGI serializes through
-its standard binary result envelope. Option values use a nested typed record,
-and partition descriptors use an Arrow binary list. Parameter uploads use a
+its standard binary result envelope. Opening connections, setting options, and
+filtered metadata discovery use named request dataclasses with native Arrow
+fields. Option values use a nested typed record, and partition descriptors use
+an Arrow binary list with signed typed claims. Parameter uploads use a
 fixed one-row envelope so empty and zero-column Arrow data remain unambiguous.
-Protocol 0.3.0 requires a matching Grainlift client; 0.2.0 wire clients must be
+Protocol 0.4.0 requires a matching Grainlift client; earlier wire clients must be
 upgraded together with the service. See [the API guide](docs/API.md) for details.
 
 The CI workflow checks Linux/macOS with Python 3.13/3.14, runs Ruff, formatting,
@@ -145,7 +147,7 @@ Targets are server-selected. `Service(database_options=..., connection_options=.
 defines authoritative settings: callers may neither supply those keys in either
 opening option scope nor mutate them afterward. Other caller options are decoded
 strictly and delegated to the worker. Option values are `str`, `bytes`, signed
-64-bit `int`, or finite `float`; booleans and duplicate keys are rejected.
+64-bit `int`, or IEEE 754 `float` (including NaN and infinities); booleans and duplicate keys are rejected.
 
 `Worker.open_connection(principal, database_options, connection_options)` is the
 database-factory hook. Its default rejects database options, calls the existing

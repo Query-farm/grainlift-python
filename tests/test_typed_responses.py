@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Nominal response types, stock VGI interoperability, and serialized size limits."""
 
+import struct
 from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
@@ -19,11 +20,14 @@ from grainlift.options import WireOptionValue
 from grainlift.protocol import (
     UNARY_OUTPUT,
     ExecuteResponse,
+    GetInfoRequest,
     Grainlift,
     OkResponse,
+    OpenConnectionRequest,
     PartitionsResponse,
     SchemaResponse,
     SessionResponse,
+    SetConnectionOptionRequest,
     StatementResponse,
     UpdateResponse,
     ValueResponse,
@@ -65,8 +69,6 @@ def test_nominal_response_roundtrip(response: ArrowSerializableDataclass) -> Non
         {"kind": "int", "int_value": True},
         {"kind": "int", "int_value": 2**63},
         {"kind": "int", "int_value": -(2**63) - 1},
-        {"kind": "double", "double_value": float("nan")},
-        {"kind": "double", "double_value": float("inf")},
         {"kind": "double", "double_value": 1},
         {"kind": "string", "bytes_value": b""},
         {"kind": "bytes", "bytes_value": b"", "string_value": ""},
@@ -88,6 +90,14 @@ def test_wire_option_native_types_survive_nested_roundtrip(value: str | bytes | 
     assert decoded == value and type(decoded) is type(value)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), -0.0])
+def test_wire_double_preserves_ieee754_values(value: float) -> None:
+    """Preserve nonfinite values and negative zero using native Arrow float64 fields."""
+    response = ValueResponse(value=WireOptionValue.from_value(value, "double"))
+    decoded = ValueResponse.deserialize_from_bytes(response.serialize_to_bytes()).value.to_value()
+    assert type(decoded) is float and struct.pack("!d", decoded) == struct.pack("!d", value)
+
+
 def test_stock_vgi_unary_methods_have_standard_binary_envelope() -> None:
     """Derive unary response envelopes from nominal types without fixed-schema runtime patches."""
     methods = rpc_methods(Grainlift)
@@ -104,7 +114,9 @@ def test_stock_http_returns_nominal_objects() -> None:
             default_headers={"Authorization": "Bearer token"},
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # Reflect the protocol.
-            session = rpc.open_connection(target="default", database_options_json="[]", connection_options_json="[]")
+            session = rpc.open_connection(
+                request=OpenConnectionRequest(target="default", database_options=[], connection_options=[])
+            )
             assert type(session) is SessionResponse
             statement = rpc.new_statement(session_id=session.session_id)
             assert type(statement) is StatementResponse
@@ -116,7 +128,11 @@ def test_stock_http_returns_nominal_objects() -> None:
             assert rpc.close_result(session_id=sid, result_id=result.result_id).ok
             assert type(rpc.execute_update(session_id=sid, statement_id=stmt)) is UpdateResponse
             assert type(rpc.execute_partitions(session_id=sid, statement_id=stmt)) is PartitionsResponse
-            rpc.set_connection_option(session_id=sid, key="binary", value_json='{"type":"bytes","value":"AP8="}')
+            rpc.set_connection_option(
+                request=SetConnectionOptionRequest(
+                    session_id=sid, key="binary", value=WireOptionValue(kind="bytes", bytes_value=b"\x00\xff")
+                )
+            )
             option = rpc.get_connection_option(session_id=sid, key="binary", value_type="bytes")
             assert type(option) is ValueResponse and type(option.value) is WireOptionValue
             assert option.value.bytes_value == b"\x00\xff"
@@ -129,18 +145,18 @@ def test_execute_response_size_boundary_closes_unregistered_cursor(headroom: int
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
-        reference = service.get_info(sid, "{}", ctx)
+        reference = service.get_info(GetInfoRequest(session_id=sid, codes=None), ctx)
         envelope = pa.RecordBatch.from_pydict({"result": [reference.serialize_to_bytes()]}, schema=UNARY_OUTPUT)
         budget = len(serialize_record_batch_bytes(envelope))
         service.close_result(sid, reference.result_id, ctx)
         service.limits = replace(service.limits, batch_bytes=budget + headroom)
         if headroom < 0:
             with pytest.raises(AdbcError, match="exceeds"):
-                service.get_info(sid, "{}", ctx)
+                service.get_info(GetInfoRequest(session_id=sid, codes=None), ctx)
             assert not service._sessions[sid].results
             assert worker.connections[0].readers[-1].closed
         else:
-            response = service.get_info(sid, "{}", ctx)
+            response = service.get_info(GetInfoRequest(session_id=sid, codes=None), ctx)
             assert response.result_id in service._sessions[sid].results
 
 
@@ -150,7 +166,9 @@ def test_oversized_session_response_closes_connection_before_registration() -> N
     with Service(worker) as service:
         service.limits = replace(service.limits, batch_bytes=1)
         with pytest.raises(AdbcError, match="exceeds"):
-            service.open_connection("default", "[]", "[]", context(service))
+            service.open_connection(
+                OpenConnectionRequest(target="default", database_options=[], connection_options=[]), context(service)
+            )
         assert not service._sessions and worker.connections[0].closed
 
 

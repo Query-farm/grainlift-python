@@ -14,7 +14,8 @@ import pytest
 from vgi_rpc import AuthContext, CallContext
 
 from grainlift import AdbcError, Connection, Limits, QueryResult, Service, Worker
-from grainlift.protocol import ResultCursor
+from grainlift.options import NamedOption, WireOptionValue
+from grainlift.protocol import OpenConnectionRequest, ResultCursor
 
 SCHEMA = pa.schema([("n", pa.int64())])
 
@@ -102,7 +103,9 @@ def context(service: Service, principal: str = "alice") -> CallContext:
 def open_session(service: Service, principal: str = "alice") -> tuple[str, CallContext]:
     """Open a test session and return its authenticated context."""
     ctx = context(service, principal)
-    sid = service.open_connection("default", "[]", "[]", ctx).session_id
+    sid = service.open_connection(
+        OpenConnectionRequest(target="default", database_options=[], connection_options=[]), ctx
+    ).session_id
     return sid, ctx
 
 
@@ -282,7 +285,14 @@ def test_reject_options_and_unsupported_methods(service: Service) -> None:
     """Verify reject options and unsupported methods."""
     ctx = context(service)
     with pytest.raises(AdbcError, match="Caller-supplied"):
-        service.open_connection("default", '[{"key":"uri","type":"string","value":"secret"}]', "[]", ctx)
+        service.open_connection(
+            OpenConnectionRequest(
+                target="default",
+                database_options=[NamedOption(key="uri", value=WireOptionValue(kind="string", string_value="secret"))],
+                connection_options=[],
+            ),
+            ctx,
+        )
     sid, ctx = open_session(service)
     with pytest.raises(AdbcError) as exc:
         service.commit(session_id=sid, ctx=ctx)

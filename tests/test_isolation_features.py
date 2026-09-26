@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import struct
 import time
 from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +27,7 @@ from grainlift import (
     Statement,
     Worker,
 )
-from grainlift.isolation import _arrow_bytes, _ChildState, _ProcessConnection
+from grainlift.isolation import _arrow_bytes, _ChildState, _option_value, _ProcessConnection
 
 SCHEMA = pa.schema([("n", pa.int64())])
 
@@ -107,9 +108,8 @@ class FeatureStatement(Statement):
         if self.sql.startswith("fault_"):
             mode = self.sql.removeprefix("fault_")
             schema = SCHEMA.with_metadata({b"large": b"x" * 4096}) if mode == "schema_size" else SCHEMA
-            return QueryResult(
-                schema, FaultingResultIterator(self.connection, mode), 2**63 if mode == "row_count" else 0
-            )
+            rows_affected = {"row_count": 2**63, "negative_count": -2}.get(mode, 0)
+            return QueryResult(schema, FaultingResultIterator(self.connection, mode), rows_affected)
         if self.reader is not None:
             return QueryResult(self.reader.schema, iter(self.reader))
         if self.batch is not None:
@@ -308,6 +308,36 @@ def test_statement_typed_options_prepare_bind_and_partitions() -> None:
     finally:
         statement.close()
         connection.close()
+
+
+@pytest.mark.parametrize("bits", ["7ff80000000000af", "7ff0000000000000", "fff0000000000000", "8000000000000000"])
+def test_isolated_double_options_preserve_ieee754_bits(bits: str) -> None:
+    """Preserve nonfinite values and signed zero through initialization and both option scopes."""
+    value = float(struct.unpack(">d", bytes.fromhex(bits))[0])
+    worker = IsolatedWorker("test_isolation_features:FeatureWorker", max_message_bytes=4096)
+    connection = worker.open_connection("alice", {"database": value}, {"connection": value})
+    try:
+        connection.set_option("mutable", value)
+        for key in ("database", "connection", "mutable"):
+            actual = connection.get_option(key, "double")
+            assert type(actual) is float and struct.pack(">d", actual).hex() == bits
+        statement = connection.new_statement()
+        try:
+            statement.set_option("statement", value)
+            actual = statement.get_option("statement", "double")
+            assert type(actual) is float and struct.pack(">d", actual).hex() == bits
+        finally:
+            statement.close()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("encoded", ["", "0" * 15, "0" * 17, "z" * 16, " " * 16, None, 1])
+def test_invalid_isolated_double_bits_rejected(encoded: object) -> None:
+    """Reject malformed private float encodings without accepting JSON numeric coercions."""
+    with pytest.raises(AdbcError) as error:
+        _option_value({"type": "double_bits", "value": encoded})
+    assert error.value.status == "invalid_data"
 
 
 def test_initial_options_transactions_and_metadata() -> None:
@@ -669,7 +699,9 @@ def test_failed_child_rebind_preserves_previous_reader_until_success() -> None:
         child.close()
 
 
-@pytest.mark.parametrize("mode", ["fetch_error", "fetch_schema", "fetch_size", "schema_size", "row_count"])
+@pytest.mark.parametrize(
+    "mode", ["fetch_error", "fetch_schema", "fetch_size", "schema_size", "row_count", "negative_count"]
+)
 def test_result_cleanup_failure_preserves_primary_error(mode: str) -> None:
     """Preserve primary error metadata and release cursor slots when backend cleanup raises."""
     connection = isolated(max_results=1)

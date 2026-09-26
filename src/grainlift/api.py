@@ -15,6 +15,25 @@ import pyarrow as pa
 
 type OptionValue = str | bytes | int | float
 
+_ERROR_STATUSES = frozenset(
+    {
+        "unknown",
+        "not_implemented",
+        "not_found",
+        "already_exists",
+        "invalid_arguments",
+        "invalid_state",
+        "invalid_data",
+        "integrity",
+        "internal",
+        "io",
+        "cancelled",
+        "timeout",
+        "unauthenticated",
+        "unauthorized",
+    }
+)
+
 
 class AdbcError(Exception):
     """An ADBC error with optional SQLSTATE, vendor code, and binary details.
@@ -40,8 +59,16 @@ class AdbcError(Exception):
             vendor_code: Downstream driver's numeric error code.
             details: Additional named binary error fields.
         """
-        if len(sqlstate) != 5 or not sqlstate.isascii():
+        if not isinstance(message, str):
+            raise ValueError("ADBC error message must be a string")
+        if status not in _ERROR_STATUSES:
+            raise ValueError("Invalid ADBC error status")
+        if type(vendor_code) is not int or not -(2**31) <= vendor_code < 2**31:
+            raise ValueError("ADBC vendor code must fit signed int32")
+        if not isinstance(sqlstate, str) or len(sqlstate) != 5 or not sqlstate.isascii():
             raise ValueError("SQLSTATE must contain five ASCII characters")
+        if details is not None and any(not isinstance(k, str) or not isinstance(v, bytes) for k, v in details.items()):
+            raise ValueError("ADBC error details must map strings to bytes")
         self.status = status
         self.error_kind = f"adbc.{status}"
         super().__init__(

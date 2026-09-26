@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Query Farm LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Grainlift 0.3.0 typed responses carried by standard VGI-RPC serialization."""
+"""Grainlift 0.4.0 typed control contract and dynamic Arrow data streams."""
 
 from dataclasses import dataclass
 from typing import ClassVar, Protocol
@@ -9,7 +9,29 @@ import pyarrow as pa
 from vgi_rpc import AnnotatedBatch, CallContext, ExchangeState, OutputCollector, ProducerState, Stream
 from vgi_rpc.utils import ArrowSerializableDataclass
 
+from .options import NamedOption as NamedOption
 from .options import WireOptionValue
+from .requests import (
+    GetInfoRequest as GetInfoRequest,
+)
+from .requests import (
+    GetObjectsRequest as GetObjectsRequest,
+)
+from .requests import (
+    GetStatisticsRequest as GetStatisticsRequest,
+)
+from .requests import (
+    GetTableSchemaRequest as GetTableSchemaRequest,
+)
+from .requests import (
+    OpenConnectionRequest as OpenConnectionRequest,
+)
+from .requests import (
+    SetConnectionOptionRequest as SetConnectionOptionRequest,
+)
+from .requests import (
+    SetStatementOptionRequest as SetStatementOptionRequest,
+)
 
 
 def schema(*fields: tuple[str, pa.DataType, bool]) -> pa.Schema:
@@ -20,6 +42,7 @@ def schema(*fields: tuple[str, pa.DataType, bool]) -> pa.Schema:
 OK = schema(("ok", pa.bool_(), False))
 BIND_INPUT = schema(("batch_ipc", pa.binary(), False), ("finish", pa.bool_(), False))
 UNARY_OUTPUT = schema(("result", pa.binary(), False))
+REQUEST_INPUT = schema(("request", pa.binary(), False))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -174,9 +197,9 @@ class Grainlift(Protocol):
     """Describe the public Grainlift ADBC wire methods."""
 
     protocol_name: ClassVar[str] = "org.queryfarm.Grainlift.v1"
-    protocol_version: ClassVar[str] = "0.3.0"
+    protocol_version: ClassVar[str] = "0.4.0"
 
-    def open_connection(self, target: str, database_options_json: str, connection_options_json: str) -> SessionResponse:
+    def open_connection(self, request: OpenConnectionRequest) -> SessionResponse:
         """Authenticate and allocate a connection within the service quota."""
         ...
 
@@ -212,7 +235,7 @@ class Grainlift(Protocol):
         """Open a pull stream at the requested result sequence."""
         ...
 
-    def set_connection_option(self, session_id: str, key: str, value_json: str) -> OkResponse:
+    def set_connection_option(self, request: SetConnectionOptionRequest) -> OkResponse:
         """Set connection option through the ADBC wire protocol."""
         ...
 
@@ -256,7 +279,7 @@ class Grainlift(Protocol):
         """Set substrait plan through the ADBC wire protocol."""
         ...
 
-    def set_statement_option(self, session_id: str, statement_id: str, key: str, value_json: str) -> OkResponse:
+    def set_statement_option(self, request: SetStatementOptionRequest) -> OkResponse:
         """Set statement option through the ADBC wire protocol."""
         ...
 
@@ -272,15 +295,15 @@ class Grainlift(Protocol):
         """Bind stream through the ADBC wire protocol."""
         ...
 
-    def get_info(self, session_id: str, args_json: str) -> ExecuteResponse:
+    def get_info(self, request: GetInfoRequest) -> ExecuteResponse:
         """Get info through the ADBC wire protocol."""
         ...
 
-    def get_objects(self, session_id: str, args_json: str) -> ExecuteResponse:
+    def get_objects(self, request: GetObjectsRequest) -> ExecuteResponse:
         """Get objects through the ADBC wire protocol."""
         ...
 
-    def get_table_schema(self, session_id: str, args_json: str) -> SchemaResponse:
+    def get_table_schema(self, request: GetTableSchemaRequest) -> SchemaResponse:
         """Get table schema through the ADBC wire protocol."""
         ...
 
@@ -292,7 +315,7 @@ class Grainlift(Protocol):
         """Get statistic names through the ADBC wire protocol."""
         ...
 
-    def get_statistics(self, session_id: str, args_json: str) -> ExecuteResponse:
+    def get_statistics(self, request: GetStatisticsRequest) -> ExecuteResponse:
         """Get statistics through the ADBC wire protocol."""
         ...
 
