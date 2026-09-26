@@ -1,0 +1,64 @@
+[project]
+name = "grainlift-python"
+version = "0.1.0"
+description = "Build ADBC services in Python with Grainlift and VGI-RPC"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+readme = "README.md"
+dependencies = ["vgi-rpc[http]>=0.47.1", "pyarrow>=19"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/grainlift"]
+
+[tool.hatch.build]
+exclude = [
+    "**/.git", "**/.claude", "**/.codex", "**/.agents", "**/.hypothesis",
+    "**/.venv", "**/venv", "**/__pycache__", "**/.mypy_cache", "**/.ruff_cache", "**/.pytest_cache",
+    "**/*.pyc", "**/.env*", "**/*.pem", "**/*.key", "**/*.crt", "**/*.cer", "**/*.p12", "**/*.pfx",
+    "**/credentials", "**/credentials.json", "**/secrets.json", "**/id_rsa", "**/id_ed25519",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/LICENSE", "/pyproject.toml", "/check_quality.sh"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.11", "mypy>=1.15", "pyarrow-stubs", "adbc-driver-manager>=1.7"]
+
+# Public source revision containing the fixed-schema and structured-error support.
+# Keep this pin until those changes ship in a new VGI-RPC index release.
+[tool.uv.sources]
+vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-python.git", rev = "cf0564f0ea9780ffbbff18995b3d027d3aa41d75" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "waitress.*"
+ignore_missing_imports = true
+
+[tool.pydoclint]
+# Keep this tool isolated: docstring-parser-fork conflicts with VGI-RPC's parser.
+style = "google"
+arg_type_hints_in_docstring = false
+check_return_types = false
+check_yield_types = false
+check_class_attributes = true
+skip_checking_raises = true
+allow_init_docstring = true
