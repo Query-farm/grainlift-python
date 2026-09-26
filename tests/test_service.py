@@ -99,23 +99,18 @@ def context(service: Service, principal: str = "alice") -> CallContext:
     )
 
 
-def value(batch: pa.RecordBatch, name: str) -> str:
-    """Extract a string handle from a single-row protocol response."""
-    return cast(str, batch.column(name)[0].as_py())
-
-
 def open_session(service: Service, principal: str = "alice") -> tuple[str, CallContext]:
     """Open a test session and return its authenticated context."""
     ctx = context(service, principal)
-    sid = value(service.open_connection("default", "[]", "[]", ctx), "session_id")
+    sid = service.open_connection("default", "[]", "[]", ctx).session_id
     return sid, ctx
 
 
 def execute(service: Service, sid: str, ctx: CallContext) -> tuple[str, str]:
     """Execute SQL and return its schema and lazy batch iterator."""
-    stmt = value(service.new_statement(sid, ctx), "statement_id")
+    stmt = service.new_statement(sid, ctx).statement_id
     service.set_sql_query(sid, stmt, "query", ctx)
-    rid = value(service.execute(sid, stmt, ctx), "result_id")
+    rid = service.execute(sid, stmt, ctx).result_id
     return stmt, rid
 
 
@@ -239,7 +234,7 @@ def test_sql_limit(size: int) -> None:
     """Verify sql limit."""
     with Service(TestWorker(), limits=Limits(sql_bytes=16)) as service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         if size > 16:
             with pytest.raises(AdbcError, match="SQL exceeds"):
                 service.set_sql_query(sid, stmt, "x" * size, ctx)
@@ -274,7 +269,7 @@ def test_schema_mismatch_closes_reader() -> None:
 def test_unexpected_error_sanitized(service: Service) -> None:
     """Verify unexpected error sanitized."""
     sid, ctx = open_session(service)
-    stmt = value(service.new_statement(sid, ctx), "statement_id")
+    stmt = service.new_statement(sid, ctx).statement_id
     service.set_sql_query(sid, stmt, "crash", ctx)
     with pytest.raises(AdbcError) as exc:
         service.execute(sid, stmt, ctx)

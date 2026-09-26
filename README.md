@@ -4,7 +4,7 @@ Build ADBC services in Python. Applications load the existing native Grainlift
 ADBC driver; your worker supplies query behavior and lazy Arrow batches over
 VGI-RPC. No downstream ADBC driver is required.
 
-The toolkit exposes the Grainlift protocol 0.2.0 ADBC operation surface over HTTP:
+The toolkit exposes the Grainlift protocol 0.3.0 ADBC operation surface over HTTP:
 transactions, statements, preparation, typed options, parameter batches and
 streams, updates and ingestion, metadata, partitioned results, and Substrait
 plans. Your backend implements each capability through `Connection` and
@@ -25,12 +25,14 @@ and run:
     ./check_quality.sh
     uv run --no-sync pytest
 
-The lockfile and source override identify the exact VGI-RPC revision required
-for the explicit unary RecordBatch schemas, structured errors, and bidirectional
-bind exchanges. Keep those two files together when reproducing a checkout.
-PyPI `vgi-rpc==0.47.1` alone is insufficient. Public repository availability is
-separate from package-index publication; publish a new VGI-RPC version and update
-the dependency floor before releasing this package to an index.
+The toolkit uses published `vgi-rpc[http]>=0.47.1`; the lockfile pins its index
+release and dependencies. No modified VGI runtime is required. Unary service
+methods return frozen typed response dataclasses, which VGI serializes through
+its standard binary result envelope. Option values use a nested typed record,
+and partition descriptors use an Arrow binary list. Parameter uploads use a
+fixed one-row envelope so empty and zero-column Arrow data remain unambiguous.
+Protocol 0.3.0 requires a matching Grainlift client; 0.2.0 wire clients must be
+upgraded together with the service. See [the API guide](docs/API.md) for details.
 
 The CI workflow checks Linux/macOS with Python 3.13/3.14, runs Ruff, formatting,
 strict mypy and isolated pydoclint, then installs the built wheel and runs its

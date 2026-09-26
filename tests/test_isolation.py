@@ -274,14 +274,14 @@ def test_rejected_startup_closes_every_pipe(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_service_shutdown_terminates_busy_child() -> None:
     """Verify service shutdown terminates busy child."""
-    from test_service import open_session, value
+    from test_service import open_session
 
     from grainlift import Service
 
     service = Service(isolated())
     with ThreadPoolExecutor(1) as pool:
         sid, ctx = open_session(service)
-        statement = value(service.new_statement(sid, ctx), "statement_id")
+        statement = service.new_statement(sid, ctx).statement_id
         service.set_sql_query(sid, statement, "hang", ctx)
         connection = cast(_ProcessConnection, service._sessions[sid].connection)
         pending = pool.submit(service.execute, sid, statement, ctx)

@@ -28,11 +28,6 @@ include = ["/src", "/tests", "/docs", "/README.md", "/LICENSE", "/pyproject.toml
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.11", "mypy>=1.15", "pyarrow-stubs", "adbc-driver-manager>=1.7"]
 
-# Public source revision containing the fixed-schema and structured-error support.
-# Keep this pin until those changes ship in a new VGI-RPC index release.
-[tool.uv.sources]
-vgi-rpc = { git = "https://github.com/Query-farm/vgi-rpc-python.git", rev = "d0ee383502fcdf57200c24181dbeda13ac11807e" }
-
 [tool.ruff]
 line-length = 120
 target-version = "py313"

@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from test_service import open_session, value
+from test_service import open_session
 
 from grainlift import AdbcError, Connection, Service, Statement, Worker
 
@@ -61,7 +61,7 @@ def test_cancel_cannot_enter_statement_during_backend_close() -> None:
     backend = ClosingStatement()
     with Service(ClosingWorker(backend)) as service, ThreadPoolExecutor(1) as pool:
         session_id, context = open_session(service)
-        statement_id = value(service.new_statement(session_id, context), "statement_id")
+        statement_id = service.new_statement(session_id, context).statement_id
         closing = pool.submit(service.close_statement, session_id, statement_id, context)
         try:
             assert backend.closing.wait(timeout=2)

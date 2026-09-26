@@ -37,6 +37,53 @@ def decode_schema(payload: bytes, limit: int) -> pa.Schema:
         raise AdbcError("Invalid bind schema", "invalid_arguments") from None
 
 
+def decode_batch(payload: bytes, limit: int) -> pa.RecordBatch:
+    """Decode exactly one bounded, uncompressed IPC parameter batch.
+
+    Compression belongs to the transport. The nested payload is an ordinary
+    uncompressed Arrow IPC stream and is decoded using PyArrow's public API.
+
+    Args:
+        payload: A complete IPC stream with schema, optional dictionaries, one batch and EOS.
+        limit: Inclusive encoded-payload and decoded-buffer byte ceiling.
+
+    Returns:
+        The decoded parameter batch with its original schema and row count.
+    """
+    if not payload or len(payload) > limit:
+        raise AdbcError("Bind payload exceeds configured limit or is empty", "invalid_data")
+    try:
+        source = pa.BufferReader(payload)
+        first = pa.ipc.read_message(source)
+        if first.type != "schema":
+            raise ValueError("Missing IPC schema")
+        batches = 0
+        while True:
+            before = source.tell()
+            try:
+                message = pa.ipc.read_message(source)
+            except EOFError:
+                if source.tell() != len(payload) or payload[before:] != b"\xff\xff\xff\xff\x00\x00\x00\x00":
+                    raise ValueError("Missing IPC end marker or trailing bytes") from None
+                break
+            if message.type == "record batch":
+                batches += 1
+                if batches != 1:
+                    raise ValueError("Multiple parameter batches in one turn")
+            elif message.type != "dictionary" or batches:
+                raise ValueError("Unexpected IPC message")
+        if batches != 1:
+            raise ValueError("Missing parameter batch")
+        with pa.ipc.open_stream(payload) as reader:
+            result = reader.read_next_batch()
+            result.validate(full=True)
+            if result.get_total_buffer_size() > limit:
+                raise ValueError("Decoded parameter buffers exceed configured limit")
+            return result
+    except (pa.ArrowException, OSError, ValueError, EOFError, struct.error, OverflowError):
+        raise AdbcError("Invalid or oversized bind IPC payload", "invalid_data") from None
+
+
 class _BoundedFile(io.RawIOBase):
     def __init__(self, limit: int) -> None:
         super().__init__()

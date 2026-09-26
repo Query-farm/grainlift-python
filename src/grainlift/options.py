@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Query Farm LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Strict bounded JSON codecs for Grainlift's four ADBC option types."""
+"""Typed option responses and bounded JSON request codecs for ADBC options."""
 
 from __future__ import annotations
 
@@ -9,9 +9,63 @@ import binascii
 import json
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
+from vgi_rpc.utils import ArrowSerializableDataclass
+
 from .api import AdbcError, OptionValue
+
+
+@dataclass(frozen=True, kw_only=True)
+class WireOptionValue(ArrowSerializableDataclass):
+    """Represent one typed ADBC option without JSON or base64 encoding.
+
+    Attributes:
+        kind: One of string, bytes, int, or double.
+        string_value: String payload, set only for the string kind.
+        bytes_value: Binary payload, set only for the bytes kind.
+        int_value: Signed 64-bit payload, set only for the int kind.
+        double_value: Finite floating-point payload, set only for the double kind.
+    """
+
+    kind: str
+    string_value: str | None = None
+    bytes_value: bytes | None = None
+    int_value: int | None = None
+    double_value: float | None = None
+
+    def __post_init__(self) -> None:
+        """Require exactly the payload field selected by the discriminator."""
+        fields = {
+            "string": self.string_value,
+            "bytes": self.bytes_value,
+            "int": self.int_value,
+            "double": self.double_value,
+        }
+        selected = fields.get(self.kind)
+        if selected is None or any(value is not None for kind, value in fields.items() if kind != self.kind):
+            raise AdbcError("Invalid typed option payload", "invalid_data")
+        _validate_value(selected, self.kind)
+
+    @classmethod
+    def from_value(cls, value: OptionValue, value_type: str) -> WireOptionValue:
+        """Validate a backend option and select its native Arrow payload field."""
+        _validate_value(value, value_type)
+        return cls(
+            kind=value_type,
+            string_value=value if isinstance(value, str) else None,
+            bytes_value=value if isinstance(value, bytes) else None,
+            int_value=value if type(value) is int else None,
+            double_value=value if type(value) is float else None,
+        )
+
+    def to_value(self) -> OptionValue:
+        """Return the validated native Python option value."""
+        for value in (self.string_value, self.bytes_value, self.int_value, self.double_value):
+            if value is not None:
+                return value
+        raise AdbcError("Invalid typed option payload", "invalid_data")
 
 
 def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -68,8 +122,7 @@ def decode_value(value: object) -> OptionValue:
     raise AdbcError("Invalid option type or value", "invalid_arguments")
 
 
-def encode_value(value: OptionValue, value_type: str | None = None) -> dict[str, object]:
-    """Encode a backend option while enforcing exact type and finite numeric ranges."""
+def _validate_value(value: OptionValue, value_type: str | None = None) -> str:
     kinds = {str: "string", bytes: "bytes", int: "int", float: "double"}
     kind = kinds.get(type(value))
     if kind is None or (value_type is not None and kind != value_type):
@@ -78,6 +131,12 @@ def encode_value(value: OptionValue, value_type: str | None = None) -> dict[str,
         raise AdbcError("Backend integer option is out of range", "invalid_data")
     if type(value) is float and not math.isfinite(value):
         raise AdbcError("Backend double option is not finite", "invalid_data")
+    return kind
+
+
+def encode_value(value: OptionValue, value_type: str | None = None) -> dict[str, object]:
+    """Encode an option request while enforcing exact type and finite numeric ranges."""
+    kind = _validate_value(value, value_type)
     return {"type": kind, "value": base64.b64encode(value).decode("ascii") if isinstance(value, bytes) else value}
 
 

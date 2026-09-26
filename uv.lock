@@ -253,7 +253,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pyarrow", specifier = ">=19" },
-    { name = "vgi-rpc", extras = ["http"], git = "https://github.com/Query-farm/vgi-rpc-python.git?rev=d0ee383502fcdf57200c24181dbeda13ac11807e" },
+    { name = "vgi-rpc", extras = ["http"], specifier = ">=0.47.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -771,12 +771,16 @@ wheels = [
 [[package]]
 name = "vgi-rpc"
 version = "0.47.1"
-source = { git = "https://github.com/Query-farm/vgi-rpc-python.git?rev=d0ee383502fcdf57200c24181dbeda13ac11807e#d0ee383502fcdf57200c24181dbeda13ac11807e" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "docstring-parser" },
     { name = "pyarrow" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/66/e9/7509cc8cadf63dec8cd6b9419c75dfae76dea7f76d5430def97c94761f89/vgi_rpc-0.47.1.tar.gz", hash = "sha256:d5c1801c088907693cf937abc7a5e47121a43d92d56517bd32ad4fd96db54850", size = 1505659, upload-time = "2026-09-18T20:51:30.211Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2e/a1/b0aea7a28414b6e1b060d7157ddc49e550f7af6b40383e935ec4c9aa610f/vgi_rpc-0.47.1-py3-none-any.whl", hash = "sha256:f0b9884358a6df7cf3c6df04d889045853f0d791d3dc5f6783e5ea28c1e18b54", size = 696128, upload-time = "2026-09-18T20:51:28.143Z" },
 ]
 
 [package.optional-dependencies]

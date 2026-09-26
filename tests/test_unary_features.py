@@ -12,7 +12,8 @@ from typing import Any
 
 import pyarrow as pa
 import pytest
-from test_service import Reader, context, open_session, value
+from test_service import Reader, context, open_session
+from vgi_rpc.utils import ArrowSerializableDataclass, serialize_record_batch_bytes
 
 from grainlift import (
     AdbcError,
@@ -25,7 +26,14 @@ from grainlift import (
     Statement,
     Worker,
 )
-from grainlift.options import decode_options, decode_value, encode_value
+from grainlift.options import WireOptionValue, decode_options, encode_value
+from grainlift.protocol import UNARY_OUTPUT, ValueResponse, schema_ipc
+
+
+def _wire_size(response: ArrowSerializableDataclass) -> int:
+    envelope = pa.RecordBatch.from_pydict({"result": [response.serialize_to_bytes()]}, schema=UNARY_OUTPUT)
+    return len(serialize_record_batch_bytes(envelope))
+
 
 SCHEMA = pa.schema([("value", pa.int64())])
 
@@ -201,7 +209,7 @@ def test_typed_connection_and_statement_option_roundtrip(option: OptionValue) ->
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         service.set_connection_option(sid, "setting", encoded, ctx)
         service.set_statement_option(sid, stmt, "setting", encoded, ctx)
         kind = str(encode_value(option)["type"])
@@ -209,7 +217,7 @@ def test_typed_connection_and_statement_option_roundtrip(option: OptionValue) ->
             service.get_connection_option(sid, "setting", kind, ctx),
             service.get_statement_option(sid, stmt, "setting", kind, ctx),
         ):
-            actual = decode_value(json.loads(value(response, "value_json")))
+            actual = response.value.to_value()
             assert actual == option and type(actual) is type(option)
 
 
@@ -286,7 +294,7 @@ def test_server_options_authoritative_across_open_and_mutation() -> None:
         assert not worker.connections
         sid, ctx = open_session(service)
         assert worker.connections[0].options == {"role": "fixed"}
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         for key in ("uri", "role"):
             with pytest.raises(AdbcError) as exc:
                 service.set_connection_option(sid, key, '{"type":"string","value":"injected"}', ctx)
@@ -296,7 +304,7 @@ def test_server_options_authoritative_across_open_and_mutation() -> None:
             assert exc.value.status == "unauthorized"
         assert not worker.connections[0].statements[0].options
         visible = service.get_connection_option(sid, "role", "string", ctx)
-        assert decode_value(json.loads(value(visible, "value_json"))) == "fixed"
+        assert visible.value.to_value() == "fixed"
 
 
 def test_statement_and_transaction_hooks_reach_backend() -> None:
@@ -304,12 +312,12 @@ def test_statement_and_transaction_hooks_reach_backend() -> None:
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         service.set_sql_query(sid, stmt, "query", ctx)
         service.prepare(sid, stmt, ctx)
-        assert service.get_parameter_schema(sid, stmt, ctx).num_rows == 1
-        assert service.execute_schema(sid, stmt, ctx).num_rows == 1
-        assert service.execute_update(sid, stmt, ctx).column("rows_affected")[0].as_py() == 7
+        assert service.get_parameter_schema(sid, stmt, ctx).schema_ipc == schema_ipc(SCHEMA)
+        assert service.execute_schema(sid, stmt, ctx).schema_ipc == schema_ipc(SCHEMA)
+        assert service.execute_update(sid, stmt, ctx).rows_affected == 7
         service.set_substrait_plan(sid, stmt, b"plan", ctx)
         service.commit(sid, ctx)
         service.rollback(sid, ctx)
@@ -339,7 +347,7 @@ def test_metadata_filters_and_result_quota() -> None:
         with pytest.raises(AdbcError, match="Result limit"):
             service.get_table_types(sid, ctx)
         assert len(backend.readers) == 2
-        service.close_result(sid, value(first, "result_id"), ctx)
+        service.close_result(sid, first.result_id, ctx)
         assert backend.readers[0].closed
         service.get_statistic_names(sid, ctx)
         service.close_connection(sid, ctx)
@@ -363,9 +371,9 @@ def test_partition_descriptors_require_owner_instance_and_live_expiry(monkeypatc
     worker = FeatureWorker()
     with Service(worker) as service, Service(worker) as other_service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         response = service.execute_partitions(sid, stmt, ctx)
-        descriptor = bytes(json.loads(value(response, "partitions_json"))[0])
+        descriptor = response.partitions[0]
         service.close_connection(sid, ctx)
         fresh, fresh_ctx = open_session(service)
         service.read_partition(fresh, descriptor, fresh_ctx)
@@ -392,14 +400,14 @@ def test_partition_count_boundary(count: int) -> None:
     worker = FeatureWorker()
     with Service(worker, limits=Limits(partitions_per_result=2)) as service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         worker.connections[0].statements[0].partitions = [b"x"] * count
         if count > 2:
             with pytest.raises(AdbcError, match="partitioned result"):
                 service.execute_partitions(sid, stmt, ctx)
         else:
             response = service.execute_partitions(sid, stmt, ctx)
-            assert len(json.loads(value(response, "partitions_json"))) == count
+            assert len(response.partitions) == count
 
 
 @pytest.mark.parametrize("bad", [True, 2**63, float("nan")])
@@ -408,7 +416,7 @@ def test_invalid_backend_update_counts_rejected(bad: Any) -> None:
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         worker.connections[0].statements[0].rows_affected = bad
         with pytest.raises(AdbcError) as exc:
             service.execute_update(sid, stmt, ctx)
@@ -418,9 +426,9 @@ def test_invalid_backend_update_counts_rejected(bad: Any) -> None:
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
 @pytest.mark.parametrize("option", [b"x" * 8, "é🌾"])
 def test_typed_option_output_boundary(headroom: int, option: OptionValue) -> None:
-    """Bound the encoded option response, including its JSON and base64 overhead."""
-    budget = len(json.dumps(encode_value(option)).encode()) + headroom
+    """Bound the typed option response including nested IPC and envelope overhead."""
     kind = str(encode_value(option)["type"])
+    budget = _wire_size(ValueResponse(value=WireOptionValue.from_value(option, kind))) + headroom
     worker = FeatureWorker()
     with Service(worker, limits=Limits(batch_bytes=budget)) as service:
         sid, ctx = open_session(service)
@@ -430,7 +438,7 @@ def test_typed_option_output_boundary(headroom: int, option: OptionValue) -> Non
                 service.get_connection_option(sid, "binary", kind, ctx)
         else:
             response = service.get_connection_option(sid, "binary", kind, ctx)
-            assert decode_value(json.loads(value(response, "value_json"))) == option
+            assert response.value.to_value() == option
 
 
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
@@ -455,7 +463,7 @@ def test_substrait_input_boundary(size: int) -> None:
     worker = FeatureWorker()
     with Service(worker, limits=Limits(request_bytes=16)) as service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         if size > 16:
             with pytest.raises(AdbcError, match="exceeds"):
                 service.set_substrait_plan(sid, stmt, b"x" * size, ctx)
@@ -467,21 +475,21 @@ def test_substrait_input_boundary(size: int) -> None:
 
 @pytest.mark.parametrize("headroom", [-1, 0, 1])
 def test_partition_serialized_output_boundary(monkeypatch: pytest.MonkeyPatch, headroom: int) -> None:
-    """Include schema and signed descriptor JSON in the partition response budget."""
+    """Include schema, binary descriptors, and nested IPC framing in the response budget."""
     monkeypatch.setattr(time, "time", lambda: 1000.0)
     worker = FeatureWorker()
     with Service(worker) as service:
         sid, ctx = open_session(service)
-        stmt = value(service.new_statement(sid, ctx), "statement_id")
+        stmt = service.new_statement(sid, ctx).statement_id
         original = service.execute_partitions(sid, stmt, ctx)
-        size = len(value(original, "partitions_json")) + len(original.column("schema_ipc")[0].as_py())
+        size = _wire_size(original)
         service.limits = replace(service.limits, batch_bytes=size + headroom)
         if headroom < 0:
             with pytest.raises(AdbcError, match="exceeds"):
                 service.execute_partitions(sid, stmt, ctx)
         else:
             response = service.execute_partitions(sid, stmt, ctx)
-            assert response.equals(original)
+            assert response == original
 
 
 def test_statistics_and_table_discovery_preserve_arguments() -> None:

@@ -3,16 +3,17 @@
 """Bind upload ownership and reader lifetime across service state transitions."""
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import pyarrow as pa
 import pytest
-from test_service import context, open_session, value
+from test_service import context, open_session
 from vgi_rpc import CallContext
+from vgi_rpc.utils import serialize_record_batch_bytes
 
 from grainlift import AdbcError, Connection, QueryResult, Service, Statement, Worker
-from grainlift.protocol import schema_ipc
+from grainlift.protocol import BIND_INPUT, schema_ipc
 
 SCHEMA = pa.schema([("value", pa.int64())])
 DATA = pa.record_batch([[1, 2, 3]], schema=SCHEMA)
@@ -85,7 +86,7 @@ class Case:
 
     def rows(self) -> list[int]:
         """Consume the configured statement result through the service pull path."""
-        rid = value(self.service.execute(self.sid, self.stmt, self.ctx), "result_id")
+        rid = self.service.execute(self.sid, self.stmt, self.ctx).result_id
         batch = self.service.next_batch(self.sid, rid, 0, self.ctx)
         assert batch is not None
         return cast(list[int], batch.column(0).to_pylist())
@@ -96,7 +97,7 @@ def case() -> Iterator[Case]:
     """Close every test's statement, reader, spool, connection and reaper."""
     with Service(RetainingWorker()) as service:
         sid, ctx = open_session(service)
-        yield Case(service, sid, value(service.new_statement(sid, ctx), "statement_id"), ctx)
+        yield Case(service, sid, service.new_statement(sid, ctx).statement_id, ctx)
 
 
 def test_cancelled_rebind_preserves_prior_reader(case: Case) -> None:
@@ -159,7 +160,7 @@ def test_foreign_principal_cannot_advance_or_cancel_upload(case: Case) -> None:
 def test_upload_handle_cannot_move_between_statements(case: Case) -> None:
     """An upload is bound to its statement in addition to its authenticated session."""
     pending = case.upload(finish=False)
-    other = value(case.service.new_statement(case.sid, case.ctx), "statement_id")
+    other = case.service.new_statement(case.sid, case.ctx).statement_id
     with pytest.raises(AdbcError, match="unavailable"):
         case.service.push_binding(case.sid, other, pending, 1, EMPTY, True, case.ctx)
     case.service.push_binding(case.sid, case.stmt, pending, 1, EMPTY, True, case.ctx)
@@ -175,6 +176,52 @@ def test_invalid_upload_turn_closes_pending_file(case: Case) -> None:
         case.service.push_binding(case.sid, case.stmt, pending, 8, EMPTY, True, case.ctx)
     assert upload._file.file.closed
     assert case.rows() == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pa.RecordBatch.from_pydict({"batch_ipc": [], "finish": []}, schema=BIND_INPUT),
+        pa.RecordBatch.from_pydict({"batch_ipc": [b"", b""], "finish": [True, True]}, schema=BIND_INPUT),
+        pa.RecordBatch.from_pydict({"batch_ipc": [None], "finish": [True]}, schema=BIND_INPUT),
+        pa.RecordBatch.from_pydict({"batch_ipc": [b""], "finish": [None]}, schema=BIND_INPUT),
+        pa.RecordBatch.from_pydict({"batch_ipc": [b""], "finish": [True]}),
+        pa.RecordBatch.from_pydict({"batch_ipc": [b"not empty"], "finish": [True]}, schema=BIND_INPUT),
+        pa.RecordBatch.from_pydict({"batch_ipc": [b""], "finish": [False]}, schema=BIND_INPUT),
+        pa.RecordBatch.from_pydict({"batch_ipc": [b"malformed"], "finish": [False]}, schema=BIND_INPUT),
+    ],
+)
+def test_invalid_bind_envelope_closes_pending_and_preserves_previous(case: Case, frame: pa.RecordBatch) -> None:
+    """Reject malformed transport frames while preserving the previous completed binding."""
+    case.upload(finish=True)
+    pending = case.upload(finish=False)
+    wrapper = case.service._sessions[case.sid].statements[case.stmt]
+    upload = wrapper.upload
+    assert upload is not None
+    with pytest.raises(AdbcError):
+        case.service.push_binding_frame(case.sid, case.stmt, pending, 1, frame, case.ctx)
+    assert upload.closed and wrapper.upload is None
+    assert case.rows() == [1, 2, 3]
+
+
+@pytest.mark.parametrize("headroom", [-1, 0, 1])
+def test_bind_envelope_buffer_boundary(case: Case, headroom: int) -> None:
+    """Bound encoded frame buffers before copying or decoding nested data."""
+    upload = case.service.bind_stream(case.sid, case.stmt, schema_ipc(SCHEMA), case.ctx).state.upload_id
+    frame = pa.RecordBatch.from_pydict(
+        {"batch_ipc": [serialize_record_batch_bytes(DATA)], "finish": [False]}, schema=BIND_INPUT
+    )
+    case.service.limits = replace(case.service.limits, request_bytes=frame.get_total_buffer_size() + headroom)
+    if headroom < 0:
+        with pytest.raises(AdbcError, match="envelope"):
+            case.service.push_binding_frame(case.sid, case.stmt, upload, 0, frame, case.ctx)
+    else:
+        case.service.push_binding_frame(case.sid, case.stmt, upload, 0, frame, case.ctx)
+        case.service.push_binding_frame(case.sid, case.stmt, upload, 0, frame, case.ctx)
+        finish = pa.RecordBatch.from_pydict({"batch_ipc": [b""], "finish": [True]}, schema=BIND_INPUT)
+        case.service.push_binding_frame(case.sid, case.stmt, upload, 1, finish, case.ctx)
+        case.service.push_binding_frame(case.sid, case.stmt, upload, 1, finish, case.ctx)
+        assert case.rows() == [1, 2, 3]
 
 
 def test_idle_reaping_closes_unfinished_input_only(case: Case) -> None:

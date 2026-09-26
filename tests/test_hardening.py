@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
-from test_service import TestConnection, TestWorker, context, execute, open_session, value
+from test_service import TestConnection, TestWorker, context, execute, open_session
 from vgi_rpc import CallContext
 
 from grainlift import AdbcError, Limits, QueryResult, Service
@@ -85,7 +85,7 @@ class BlockingWorker(TestWorker):
 
 def blocking_statement(service: Service, sid: str, ctx: CallContext) -> str:
     """Create a statement that waits for the release event."""
-    statement = value(service.new_statement(sid, ctx), "statement_id")
+    statement = service.new_statement(sid, ctx).statement_id
     service.set_sql_query(sid, statement, "block", ctx)
     return statement
 

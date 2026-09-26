@@ -47,15 +47,18 @@ metadata. Metadata hooks return the standard ADBC Arrow schemas supplied by the
 backend; the toolkit does not synthesize database discovery answers.
 
 `PartitionedResult` holds a `pa.Schema`, `list[bytes]` of backend descriptors,
-and `rows_affected` (`-1` when unknown). The native wire encodes exported opaque
-bytes as JSON byte arrays. Toolkit wrappers expire after `Limits.idle_seconds`,
+and `rows_affected` (`-1` when unknown). The typed wire response carries exported
+opaque bytes as an Arrow binary list. Toolkit wrappers expire after `Limits.idle_seconds`,
 are bound to one service instance/target/principal, and may be read from another
 connection belonging to that principal. Backend partition lifetime may be
 shorter. A wrapper does not guarantee a backend snapshot survives transaction or
 connection closure.
 
-`OptionValue` is `str | bytes | int | float`. Wire tags are `string`, `bytes`
-(base64), `int` (signed 64-bit), and `double` (finite). Explicit get-option type
+`OptionValue` is `str | bytes | int | float`. Option responses contain
+`WireOptionValue`, a nested Arrow record with a `kind` discriminator and exactly
+one non-null field: `string_value`, `bytes_value`, `int_value` (signed 64-bit), or
+`double_value` (finite). Bytes remain native binary. Option requests retain their
+existing tagged JSON representation, including base64 for bytes. Explicit get-option type
 mismatches are errors, not coercions. Opening option lists reject duplicate
 keys and malformed JSON; configured server keys cannot be shadowed across the
 database and connection scopes. The service copies configuration mappings so
@@ -70,7 +73,14 @@ the entire backend connection and all child handles; clients must reconnect.
 ## Binding and ingestion
 
 The transport uploads parameters one batch at a time to an anonymous temporary
-Arrow IPC spool. `Limits.bind_bytes` includes the schema, dictionary messages,
+Arrow IPC spool. Each transport turn is exactly one row with non-null
+`batch_ipc: binary` and `finish: bool` fields. A data turn contains a standard IPC
+stream with exactly one parameter batch, including its schema; a finish turn
+requires empty bytes. Nested IPC is uncompressed; compression belongs entirely
+to the transport layer, which supplies decompressed bytes to the SDK. Extra
+batches, missing end markers, and trailing data are rejected before binding.
+Zero-row and zero-column data
+are valid data turns. `Limits.bind_bytes` includes the schema, dictionary messages,
 batches, and end-of-stream framing; `Limits.batch_bytes` independently bounds
 each batch. `bind` requires exactly one batch. `bind_stream` permits an empty
 stream with a known schema. The explicit end-of-input marker is separate from
@@ -99,7 +109,7 @@ only the chosen engine determines which plans it supports.
 | Live query/metadata/partition result handles per session | 32 |
 | Referenced Arrow buffers per batch / schema descriptor bytes | 1 MiB each |
 | HTTP request body / Substrait input / typed option input JSON | 2 MiB each |
-| Encoded typed option output / partition schema plus descriptor JSON | 1 MiB each |
+| Unary response, including nested IPC and outer result envelope | 1 MiB |
 | SQL UTF-8 bytes | 64 KiB |
 | Complete Arrow IPC parameter spool | 64 MiB |
 | Partition descriptors per execution | 1,024 |
@@ -111,6 +121,24 @@ statement/result counts, and child parameter spools. Defaults are 2 MiB per
 message, 32 child statements, 32 child results, and 64 MiB per binding spool.
 These transport and handle limits cannot prevent arbitrary allocations inside
 trusted worker code; apply OS/container memory and CPU limits.
+
+## Typed wire responses
+
+Protocol `org.queryfarm.Grainlift.v1`, version `0.3.0`, uses stock VGI-RPC
+`ArrowSerializableDataclass` returns. `grainlift.protocol` defines frozen,
+keyword-only `OkResponse`, `SessionResponse`, `StatementResponse`,
+`ExecuteResponse`, `SchemaResponse`, `ValueResponse`, `UpdateResponse`, and
+`PartitionsResponse`. Service methods return these objects directly. VGI wraps
+each object's single-row IPC stream in its standard non-null `result: binary`
+column; query result streams still carry ordinary pull-based Arrow batches.
+
+Response size checks include the nested schema and record batch plus the outer
+IPC envelope. Result handles are registered only after this validation succeeds;
+oversized metadata responses close their backend cursors. `schema_ipc` fields
+retain Grainlift's unframed FlatBuffer schema-message format. Bind acknowledgements
+remain a raw non-null `ok: bool` batch. Method names and request primitives remain
+unchanged, but the response and binding formats are incompatible with protocol
+0.2.0; upgrade clients and servers together.
 
 Focused regression coverage lives in `tests/test_unary_features.py`,
 `tests/test_binding.py`, `tests/test_binding_service.py`, and

@@ -4,23 +4,62 @@
 
 import logging
 from io import BytesIO
+from typing import cast
 from wsgiref.types import WSGIApplication
 
 import falcon.testing
 import pyarrow as pa
 import pytest
 import waitress
-from test_service import TestConnection, TestWorker, value
+from test_binding_service import RetainingStatement, RetainingWorker
+from test_service import TestConnection, TestWorker
 from vgi_rpc import AnnotatedBatch, RpcError
 from vgi_rpc.http import http_connect
 from vgi_rpc.http._testing import _SyncTestClient
 from vgi_rpc.rpc import rpc_methods
 from vgi_rpc.rpc._wire import _write_request
+from vgi_rpc.utils import serialize_record_batch_bytes
 from waitress.adjustments import Adjustments
 from waitress.parser import HTTPRequestParser
 
 from grainlift import Limits, Service, serve
-from grainlift.protocol import Grainlift, schema_ipc
+from grainlift.protocol import BIND_INPUT, Grainlift, schema_ipc
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [
+        pa.RecordBatch.from_pydict({}),
+        pa.RecordBatch.from_struct_array(cast(pa.StructArray, pa.array([{}, {}], type=pa.struct([])))),
+        pa.record_batch([pa.array([], type=pa.int64())], names=["value"]),
+        pa.record_batch([pa.array(["a", "b", "a"]).dictionary_encode()], names=["value"]),
+    ],
+)
+def test_stock_http_binding_preserves_empty_shapes_and_dictionaries(batch: pa.RecordBatch) -> None:
+    """Keep exchange input nonempty while preserving arbitrary Arrow parameter schemas."""
+    with Service(RetainingWorker()) as service:
+        client = _SyncTestClient(
+            service.app(tokens={"token": "alice"}),  # type: ignore[arg-type]  # Callable WSGI wrapper.
+            default_headers={"Authorization": "Bearer token"},
+        )
+        with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # Protocol reflection.
+            sid = rpc.open_connection(
+                target="default", database_options_json="[]", connection_options_json="[]"
+            ).session_id
+            stmt = rpc.new_statement(session_id=sid).statement_id
+            with rpc.bind_stream(session_id=sid, statement_id=stmt, schema_ipc=schema_ipc(batch.schema)) as stream:
+                frame = pa.RecordBatch.from_pydict(
+                    {"batch_ipc": [serialize_record_batch_bytes(batch)], "finish": [False]}, schema=BIND_INPUT
+                )
+                assert stream.exchange(AnnotatedBatch(frame)).batch.column("ok")[0].as_py() is True
+                finish = pa.RecordBatch.from_pydict({"batch_ipc": [b""], "finish": [True]}, schema=BIND_INPUT)
+                assert stream.exchange(AnnotatedBatch(finish)).batch.column("ok")[0].as_py() is True
+            backend = service._sessions[sid].statements[stmt].backend
+            assert isinstance(backend, RetainingStatement) and backend.reader is not None
+            assert backend.reader.schema.equals(batch.schema, check_metadata=True)
+            assert backend.reader.read_next_batch().equals(batch)
+            with pytest.raises(StopIteration):
+                backend.reader.read_next_batch()
 
 
 def test_continuation_checks_principal() -> None:
@@ -31,13 +70,12 @@ def test_continuation_checks_principal() -> None:
             default_headers={"Authorization": "Bearer alice-token"},
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # VGI reflects the protocol class.
-            sid = value(
-                rpc.open_connection(target="default", database_options_json="[]", connection_options_json="[]"),
-                "session_id",
-            )
-            stmt = value(rpc.new_statement(session_id=sid), "statement_id")
+            sid = rpc.open_connection(
+                target="default", database_options_json="[]", connection_options_json="[]"
+            ).session_id
+            stmt = rpc.new_statement(session_id=sid).statement_id
             rpc.set_sql_query(session_id=sid, statement_id=stmt, sql="query")
-            rid = value(rpc.execute(session_id=sid, statement_id=stmt), "result_id")
+            rid = rpc.execute(session_id=sid, statement_id=stmt).result_id
             stream = rpc.read_result(session_id=sid, result_id=rid, sequence=0)
             batches = iter(stream)
             assert next(batches).batch.num_rows == 2
@@ -56,11 +94,10 @@ def test_unsupported_bind_has_adbc_error() -> None:
             default_headers={"Authorization": "Bearer token"},
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # VGI reflects the protocol class.
-            sid = value(
-                rpc.open_connection(target="default", database_options_json="[]", connection_options_json="[]"),
-                "session_id",
-            )
-            stmt = value(rpc.new_statement(session_id=sid), "statement_id")
+            sid = rpc.open_connection(
+                target="default", database_options_json="[]", connection_options_json="[]"
+            ).session_id
+            stmt = rpc.new_statement(session_id=sid).statement_id
             with (
                 pytest.raises(RpcError, match="not_implemented"),
                 rpc.bind(
@@ -70,8 +107,18 @@ def test_unsupported_bind_has_adbc_error() -> None:
                 ) as stream,
             ):
                 empty = pa.RecordBatch.from_pydict({}, schema=pa.schema([]))
-                stream.exchange(AnnotatedBatch(empty))
-                stream.exchange(AnnotatedBatch(empty, pa.KeyValueMetadata({b"GRAINLIFT:bind_finish": b"1"})))
+                stream.exchange(
+                    AnnotatedBatch(
+                        pa.RecordBatch.from_pydict(
+                            {"batch_ipc": [serialize_record_batch_bytes(empty)], "finish": [False]}, schema=BIND_INPUT
+                        )
+                    )
+                )
+                stream.exchange(
+                    AnnotatedBatch(
+                        pa.RecordBatch.from_pydict({"batch_ipc": [b""], "finish": [True]}, schema=BIND_INPUT)
+                    )
+                )
 
 
 def test_transport_logs_are_suppressed(caplog: pytest.LogCaptureFixture) -> None:
@@ -114,13 +161,12 @@ def test_isolated_worker_through_wsgi() -> None:
             default_headers={"Authorization": "Bearer token"},
         )
         with http_connect(Grainlift, client=client) as rpc:  # type: ignore[type-abstract]  # VGI reflects the protocol class.
-            sid = value(
-                rpc.open_connection(target="default", database_options_json="[]", connection_options_json="[]"),
-                "session_id",
-            )
-            stmt = value(rpc.new_statement(session_id=sid), "statement_id")
+            sid = rpc.open_connection(
+                target="default", database_options_json="[]", connection_options_json="[]"
+            ).session_id
+            stmt = rpc.new_statement(session_id=sid).statement_id
             rpc.set_sql_query(session_id=sid, statement_id=stmt, sql="ok")
-            rid = value(rpc.execute(session_id=sid, statement_id=stmt), "result_id")
+            rid = rpc.execute(session_id=sid, statement_id=stmt).result_id
             with rpc.read_result(session_id=sid, result_id=rid, sequence=0) as stream:
                 assert [item.batch.column(0).to_pylist() for item in stream] == [[0, 1, 2]]
             rpc.cancel_connection(session_id=sid)
