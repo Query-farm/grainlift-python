@@ -54,6 +54,15 @@ class TokenStore:
         with self._lock:
             self._tokens = tuple(updated)
 
+    def principals(self) -> frozenset[str]:
+        """Return the principals of the current credential set.
+
+        Returns:
+            Every configured principal name.
+        """
+        with self._lock:
+            return frozenset(principal for _, principal in self._tokens)
+
     def authenticate(self, authorization: str) -> str | None:
         """Return the configured principal for a matching authorization header.
 

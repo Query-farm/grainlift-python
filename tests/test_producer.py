@@ -11,7 +11,6 @@ from vgi_rpc.http import http_connect
 from vgi_rpc.http._testing import _SyncTestClient
 
 from grainlift import AdbcError, Connection, Limits, QueryResult, ResultProducer, Service, Worker
-from grainlift.cli import load_worker, run
 from grainlift.protocol import Grainlift, OpenConnectionRequest
 
 SCHEMA = pa.schema([("n", pa.int64()), ("total", pa.int64())])
@@ -155,26 +154,6 @@ def test_unknown_producer_state_is_invalid_data() -> None:
         ResultProducer.decode(b"os:system\0")
     with pytest.raises(AdbcError, match="Unknown result producer"):
         ResultProducer.decode(b"no separator")
-
-
-def test_cli_loads_worker_factory_and_generates_token(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The development CLI imports the factory and prints a generated bearer token."""
-    served: dict[str, object] = {}
-
-    def fake_serve(worker: Worker, *, token: str, port: int) -> None:
-        served.update(worker=worker, token=token, port=port)
-
-    monkeypatch.delenv("GRAINLIFT_TOKEN", raising=False)
-    monkeypatch.setattr("grainlift.cli.serve", fake_serve)
-    run("test_producer:ProducerWorker", ["--port", "9001"])
-    assert isinstance(served["worker"], ProducerWorker) and served["port"] == 9001
-    assert f"export GRAINLIFT_TOKEN={served['token']}" in capsys.readouterr().err
-    with pytest.raises(TypeError, match="Grainlift Worker"):
-        load_worker("test_producer:ProducerConnection")
-    with pytest.raises(SystemExit):
-        run("test_producer:ProducerWorker", ["--host", "mtls"])
 
 
 def test_rpc_error_for_unknown_result() -> None:

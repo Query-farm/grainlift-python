@@ -19,6 +19,7 @@ from .server import Service, serve
 from .tcp import TcpServer, TLSConfig
 
 TOKEN_VARIABLE = "GRAINLIFT_TOKEN"
+ANONYMOUS_PRINCIPAL = "anonymous"
 
 
 def load_worker(factory: str) -> Worker:
@@ -39,7 +40,7 @@ def load_worker(factory: str) -> Worker:
     return worker
 
 
-def _parser(description: str | None, *, with_factory: bool) -> argparse.ArgumentParser:
+def _parser(description: str | None, *, with_factory: bool, auth: str = "token") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     if with_factory:
         parser.add_argument("factory", help="worker to serve, as module:factory")
@@ -50,6 +51,12 @@ def _parser(description: str | None, *, with_factory: bool) -> argparse.Argument
         help="HTTP with Waitress (default), HTTP with Granian, or verified TCP/mTLS",
     )
     parser.add_argument("--port", type=int, default=8080, help="loopback port (default: 8080)")
+    parser.add_argument(
+        "--auth",
+        choices=("token", "anonymous"),
+        default=auth,
+        help=f"HTTP access: require a bearer token, or also allow clients without one (default: {auth})",
+    )
     tls = parser.add_argument_group("mTLS (--host mtls)")
     tls.add_argument("--tls-cert", help="server certificate chain (PEM)")
     tls.add_argument("--tls-key", help="server private key (PEM)")
@@ -58,8 +65,15 @@ def _parser(description: str | None, *, with_factory: bool) -> argparse.Argument
     return parser
 
 
-def _development_token() -> str:
+def _http_access(auth: str) -> tuple[dict[str, str] | None, str | None]:
     token = os.environ.get(TOKEN_VARIABLE)
+    if auth == "anonymous":
+        print(f"Anonymous access enabled: clients connect without a token as {ANONYMOUS_PRINCIPAL!r}", flush=True)
+        return ({token: "developer"} if token else None), ANONYMOUS_PRINCIPAL
+    return {_development_token(token): "developer"}, None
+
+
+def _development_token(token: str | None) -> str:
     if token:
         return token
     token = secrets.token_urlsafe(24)
@@ -80,11 +94,15 @@ def _serve_mtls(parser: argparse.ArgumentParser, args: argparse.Namespace, facto
         stop.wait()
 
 
-def run(factory: str, argv: Sequence[str] | None = None, *, description: str | None = None) -> None:
+def run(
+    factory: str, argv: Sequence[str] | None = None, *, description: str | None = None, auth: str = "token"
+) -> None:
     """Serve one worker on loopback for development, choosing the host from the command line.
 
     HTTP hosts authenticate with the bearer token in ``GRAINLIFT_TOKEN``; when it
     is unset, a random token is generated and printed for the client to export.
+    With ``--auth anonymous``, clients may also connect without a token; use it
+    only for workers that are safe to expose publicly, such as read-only data.
     The mTLS host authorizes one client certificate URI instead. Production
     deployments should configure ``Service``, ``TcpServer`` or ``serve_granian``
     directly with their own credentials and limits.
@@ -93,8 +111,11 @@ def run(factory: str, argv: Sequence[str] | None = None, *, description: str | N
         factory: Importable ``module:factory`` returning a Worker. Granian imports it in its serving process.
         argv: Command-line arguments; defaults to ``sys.argv[1:]``.
         description: Help text shown by ``--help``.
+        auth: Default for ``--auth``: ``token`` or ``anonymous``.
     """
-    parser = _parser(description, with_factory=False)
+    if auth not in ("token", "anonymous"):
+        raise ValueError("auth must be 'token' or 'anonymous'")
+    parser = _parser(description, with_factory=False, auth=auth)
     _dispatch(parser, parser.parse_args(argv), factory)
 
 
@@ -102,11 +123,13 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, factory
     if args.host == "mtls":
         _serve_mtls(parser, args, factory)
     elif args.host == "granian":
-        token = _development_token()
+        tokens, anonymous = _http_access(args.auth)
         print(f"Grainlift listening on http://127.0.0.1:{args.port}", flush=True)
-        serve_granian(factory, tokens={token: "developer"}, port=args.port)
+        serve_granian(factory, tokens=tokens, anonymous_principal=anonymous, port=args.port)
     else:
-        serve(load_worker(factory), token=_development_token(), port=args.port)
+        tokens, anonymous = _http_access(args.auth)
+        token = next(iter(tokens)) if tokens else None
+        serve(load_worker(factory), token=token, anonymous_principal=anonymous, port=args.port)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

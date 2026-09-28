@@ -160,6 +160,26 @@ your own console script) serves a worker on loopback with `--host waitress`,
 `granian` or `mtls`. HTTP hosts read the bearer token from `GRAINLIFT_TOKEN`,
 or generate and print one when it is unset.
 
+### Anonymous access
+
+Authentication is required by default. A service that only exposes public,
+read-only data can also accept clients without credentials:
+
+```python
+app = service.app(anonymous_principal="anonymous")                        # anonymous only
+app = service.app(tokens={token: "analyst"}, anonymous_principal="anonymous")  # both
+```
+
+Requests without an `Authorization` header act as the anonymous principal. The
+native driver sends no header when `grainlift.auth.bearer_token` is unset. A
+request with a wrong token is rejected, never downgraded to anonymous. All
+anonymous clients share one principal, so it should reach only public
+capabilities: the toolkit does not decide which statements are read-only, and
+the worker can check the `principal` passed to `Worker.connect`. Anonymous
+continuation tokens are sealed in a separate authentication domain, and the
+anonymous principal must differ from every token principal. `serve()`,
+`serve_granian()` and `grainlift serve --auth anonymous` accept the same option.
+
 ## Lifecycle and resource contract
 
 Each service owns its sessions in one process. Route all calls, including

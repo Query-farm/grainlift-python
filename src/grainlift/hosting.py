@@ -11,12 +11,17 @@ from multiprocessing.util import Finalize
 from typing import Any
 
 from .api import Limits, Worker
-from .credentials import TokenStore
-from .server import Service
+from .server import Service, access_credentials
 from .telemetry import PrivateApplication
 
 
-def _load(factory: str, options: dict[str, Any], tokens: dict[str, str], limits: Limits) -> PrivateApplication:
+def _load(
+    factory: str,
+    options: dict[str, Any],
+    tokens: dict[str, str] | None,
+    limits: Limits,
+    anonymous_principal: str | None = None,
+) -> PrivateApplication:
     module, _, name = factory.partition(":")
     worker = getattr(importlib.import_module(module), name)(**options)
     if not isinstance(worker, Worker):
@@ -31,7 +36,7 @@ def _load(factory: str, options: dict[str, Any], tokens: dict[str, str], limits:
             logging.getLogger("grainlift.host").error("Grainlift worker cleanup did not complete")
 
     try:
-        application = service.app(tokens=tokens)
+        application = service.app(tokens=tokens, anonymous_principal=anonymous_principal)
         # Spawned workers bypass atexit; multiprocessing finalizers still run on
         # orderly exit. The supervisor forcibly terminates a worker past its deadline.
         Finalize(None, finish, exitpriority=10)
@@ -44,13 +49,14 @@ def _load(factory: str, options: dict[str, Any], tokens: dict[str, str], limits:
 def serve_granian(
     factory: str,
     *,
-    tokens: dict[str, str],
+    tokens: dict[str, str] | None = None,
     worker_options: dict[str, Any] | None = None,
     port: int = 8080,
     threads: int = 8,
     backpressure: int = 64,
     shutdown_seconds: int = 15,
     limits: Limits | None = None,
+    anonymous_principal: str | None = None,
 ) -> None:
     """Serve authenticated loopback HTTP with Granian's process supervisor.
 
@@ -69,6 +75,7 @@ def serve_granian(
         backpressure: Maximum concurrently admitted requests; overload waits upstream.
         shutdown_seconds: Supervisor grace period before forced process termination.
         limits: ADBC quotas and backend cleanup deadlines.
+        anonymous_principal: Principal for requests without credentials; None requires a token.
     """
     if not factory.partition(":")[0] or not factory.partition(":")[2]:
         raise ValueError("Worker factory must use module:factory syntax")
@@ -77,7 +84,7 @@ def serve_granian(
             raise ValueError("Granian host limits must be positive integers")
     if port > 65535:
         raise ValueError("Invalid HTTP port")
-    TokenStore(tokens)
+    access_credentials(tokens, anonymous_principal)
     service_limits = limits or Limits()
     if shutdown_seconds <= service_limits.shutdown_seconds:
         raise ValueError("Supervisor deadline must exceed service shutdown deadline")
@@ -105,6 +112,13 @@ def serve_granian(
         respawn_failed_workers=False,
     )
     server.serve(
-        target_loader=partial(_load, factory, dict(worker_options or {}), dict(tokens), service_limits),
+        target_loader=partial(
+            _load,
+            factory,
+            dict(worker_options or {}),
+            dict(tokens) if tokens is not None else None,
+            service_limits,
+            anonymous_principal,
+        ),
         wrap_loader=False,
     )

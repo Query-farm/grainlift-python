@@ -935,14 +935,34 @@ class Service:
         if statement.upload_id == upload_id:
             self._discard_upload(statement)
 
-    def app(self, *, tokens: dict[str, str] | TokenStore) -> PrivateApplication:
-        """Create authenticated WSGI app; token values map to configured principals."""
-        credentials = tokens if isinstance(tokens, TokenStore) else TokenStore(tokens)
+    def app(
+        self, *, tokens: dict[str, str] | TokenStore | None = None, anonymous_principal: str | None = None
+    ) -> PrivateApplication:
+        """Create the WSGI app, authenticating bearer tokens and optionally anonymous requests.
+
+        Anonymous access is for services that are safe to expose without
+        credentials, such as read-only data. Requests without an Authorization
+        header act as ``anonymous_principal``; all anonymous clients share that
+        principal, so the worker should grant it only public, read-only
+        capabilities. A request that presents a bearer token which does not
+        match is rejected, never downgraded to anonymous.
+
+        Args:
+            tokens: Bearer secrets mapped to principals; optional when anonymous access is enabled.
+            anonymous_principal: Principal for requests without credentials; None requires a token.
+
+        Returns:
+            The WSGI application.
+        """
+        credentials = access_credentials(tokens, anonymous_principal)
 
         def authenticate(req: falcon.Request) -> AuthContext:
-            supplied = req.get_header("Authorization") or ""
-            principal = credentials.authenticate(supplied)
-            if principal is not None:
+            supplied = req.get_header("Authorization")
+            if supplied is None and anonymous_principal is not None:
+                # A distinct domain keeps anonymous continuation tokens separate from token principals.
+                return AuthContext(domain="grainlift.anonymous", authenticated=True, principal=anonymous_principal)
+            principal = credentials.authenticate(supplied or "") if credentials is not None else None
+            if principal is not None and principal != anonymous_principal:
                 return AuthContext(domain="grainlift", authenticated=True, principal=principal)
             raise ValueError("Authentication required")
 
@@ -959,12 +979,51 @@ class Service:
         return PrivateApplication(app)
 
 
-def serve(worker: Worker, *, token: str, port: int = 8080, limits: Limits | None = None) -> None:
-    """Serve on loopback. Deployment behind TLS requires a process-affine WSGI host."""
+def access_credentials(
+    tokens: dict[str, str] | TokenStore | None, anonymous_principal: str | None
+) -> TokenStore | None:
+    """Validate an HTTP access configuration.
+
+    Args:
+        tokens: Bearer secrets mapped to principals, if any.
+        anonymous_principal: Principal for requests without credentials, if enabled.
+
+    Returns:
+        The token store, or None for anonymous-only access.
+    """
+    if tokens is None and anonymous_principal is None:
+        raise ValueError("Configure bearer tokens, anonymous access, or both")
+    if anonymous_principal is not None and (
+        not isinstance(anonymous_principal, str) or not anonymous_principal or len(anonymous_principal) > 1024
+    ):
+        raise ValueError("Invalid anonymous principal")
+    credentials = tokens if tokens is None or isinstance(tokens, TokenStore) else TokenStore(tokens)
+    if credentials is not None and anonymous_principal in credentials.principals():
+        raise ValueError("The anonymous principal must differ from every token principal")
+    return credentials
+
+
+def serve(
+    worker: Worker,
+    *,
+    token: str | None = None,
+    port: int = 8080,
+    limits: Limits | None = None,
+    anonymous_principal: str | None = None,
+) -> None:
+    """Serve on loopback. Deployment behind TLS requires a process-affine WSGI host.
+
+    Args:
+        worker: Worker to serve.
+        token: Bearer token for the ``developer`` principal; optional with anonymous access.
+        port: Loopback port.
+        limits: ADBC quotas and cleanup deadlines.
+        anonymous_principal: Principal for requests without credentials; None requires the token.
+    """
     import waitress
 
     with Service(worker, limits=limits) as service:
-        app = service.app(tokens={token: "developer"})
+        app = service.app(tokens={token: "developer"} if token else None, anonymous_principal=anonymous_principal)
         print(f"Grainlift target {worker.target!r} listening on http://127.0.0.1:{port}", flush=True)
         # Waitress rejects Content-Length >= its cap; the SDK rejects > its cap.
         # Translate the host boundary while retaining the exact application limit.
