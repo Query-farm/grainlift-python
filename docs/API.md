@@ -18,7 +18,7 @@ is unavailable or a backend operation fails.
 | SQL and Substrait | `Statement.set_sql_query(sql)`, `set_substrait_plan(payload)` | Bound input size and retire replaced result/binding state |
 | Preparation | `Statement.prepare()`, `get_parameter_schema()` | Reject unfinished uploads; preserve backend parameter schema |
 | Parameter binding | `Statement.bind(batch)`, `bind_stream(reader)` | Validate schema/sequence, spool bounded Arrow IPC, require explicit finish, and own retained readers |
-| Query results | `Statement.execute() -> QueryResult` | Allocate a bounded result handle and pull one batch per fetch with immediate replay |
+| Query results | `Statement.execute() -> QueryResult` (iterator or `QueryResult.from_producer`) | Allocate a bounded result handle and pull one batch per fetch with immediate replay; producer state rides in the HTTP continuation token |
 | Updates and ingestion | `Statement.execute_update() -> int | None` | Preserve the affected-row count; ingestion is configured through statement options and bindings |
 | Result schema | `Statement.execute_schema() -> pa.Schema` | Return a bounded Arrow schema without forcing query execution |
 | Typed options | `Connection`/`Statement`.`set_option(key, value)` and `get_option(key, value_type)` | Strict string/bytes/int/double wire codec; enforce authoritative configured keys |

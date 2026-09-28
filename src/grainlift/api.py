@@ -4,14 +4,17 @@
 
 from __future__ import annotations
 
+import abc
 import base64
 import json
 import math
 from collections.abc import Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import ClassVar, Self
 
 import pyarrow as pa
+from vgi_rpc.utils import ArrowSerializableDataclass
 
 type OptionValue = str | bytes | int | float
 
@@ -97,6 +100,7 @@ class Limits:
         batch_bytes: Maximum batch buffer bytes and schema descriptor bytes.
         request_bytes: Maximum HTTP request body bytes.
         sql_bytes: Maximum UTF-8 encoded SQL bytes per statement.
+        producer_state_bytes: Maximum serialized ResultProducer state carried in a continuation token.
         idle_seconds: Idle lifetime of connections and result cursors.
         lock_timeout_seconds: Maximum wait to acquire a busy session lock.
         shutdown_seconds: Total wait budget for busy session locks at shutdown.
@@ -110,6 +114,7 @@ class Limits:
     batch_bytes: int = 1024 * 1024
     request_bytes: int = 2 * 1024 * 1024
     sql_bytes: int = 64 * 1024
+    producer_state_bytes: int = 64 * 1024
     idle_seconds: float = 300
     lock_timeout_seconds: float = 5
     shutdown_seconds: float = 5
@@ -125,6 +130,7 @@ class Limits:
             "batch_bytes",
             "request_bytes",
             "sql_bytes",
+            "producer_state_bytes",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -135,6 +141,75 @@ class Limits:
                 raise ValueError(f"{name} must be a finite positive number")
 
 
+class ResultProducer(ArrowSerializableDataclass, abc.ABC):
+    """Serializable result state that produces one batch per call.
+
+    An alternative to a batch iterator: subclass it as a ``@dataclass`` whose
+    fields hold everything needed to produce the rest of the result, and return
+    it with [`QueryResult.from_producer`][grainlift.QueryResult.from_producer].
+    Over HTTP the service serializes the producer into the encrypted
+    continuation token after every batch, so no iterator, cursor or replay
+    batch is retained in server memory between fetches, and a retried fetch
+    re-produces its batch from the token's state. Other transports drive the
+    same object in memory.
+
+    Fields must be Arrow-serializable (``str``, ``bytes``, ``int``, ``float``,
+    ``bool``, lists, dicts, enums, nested serializable dataclasses, or
+    ``| None`` of those). Keep sockets, files and backend cursors out of the
+    state; results that need them should use an iterator instead. The
+    serialized state is bounded by ``Limits.producer_state_bytes``.
+    """
+
+    _registry: ClassVar[dict[str, type[ResultProducer]]] = {}
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Register concrete subclasses so serialized state can be restored."""
+        super().__init_subclass__(**kwargs)
+        ResultProducer._registry[f"{cls.__module__}:{cls.__qualname__}"] = cls
+
+    @abc.abstractmethod
+    def produce(self) -> pa.RecordBatch | None:
+        """Return the next batch and advance the state, or None at end of result.
+
+        Returns:
+            The next batch matching the result schema, or None when exhausted.
+        """
+
+    def encode(self) -> bytes:
+        """Serialize the producer, including its registered type name.
+
+        Returns:
+            The type name and Arrow-serialized fields.
+        """
+        cls = type(self)
+        return f"{cls.__module__}:{cls.__qualname__}".encode() + b"\0" + self.serialize_to_bytes()
+
+    @classmethod
+    def decode(cls, payload: bytes) -> ResultProducer:
+        """Restore a producer serialized by [`encode`][grainlift.ResultProducer.encode].
+
+        Args:
+            payload: Bytes produced by ``encode``.
+
+        Returns:
+            A new producer with the serialized state.
+        """
+        name, separator, data = payload.partition(b"\0")
+        producer_type = ResultProducer._registry.get(name.decode("utf-8", "replace")) if separator else None
+        if producer_type is None:
+            raise AdbcError("Unknown result producer", "invalid_data")
+        return producer_type.deserialize_from_bytes(data)
+
+    def batches(self) -> Iterator[pa.RecordBatch]:
+        """Drive the producer in memory until it is exhausted.
+
+        Yields:
+            Each produced batch.
+        """
+        while (batch := self.produce()) is not None:
+            yield batch
+
+
 @dataclass
 class QueryResult:
     """Known schema and lazy batches whose iterator owns cursor resources.
@@ -143,11 +218,27 @@ class QueryResult:
         schema: Stable schema shared by every batch in the result.
         batches: Lazy iterator with an optional close() cleanup method.
         rows_affected: Affected-row count, or None when unknown.
+        producer: Serializable state behind ``batches``, when built with ``from_producer``.
     """
 
     schema: pa.Schema
     batches: Iterator[pa.RecordBatch]
     rows_affected: int | None = None
+    producer: ResultProducer | None = None
+
+    @classmethod
+    def from_producer(cls, schema: pa.Schema, producer: ResultProducer, rows_affected: int | None = None) -> Self:
+        """Build a result whose state is carried by a serializable producer.
+
+        Args:
+            schema: Stable schema shared by every produced batch.
+            producer: Initial result state; the result owns this object.
+            rows_affected: Affected-row count, or None when unknown.
+
+        Returns:
+            A result that iterates the producer in memory or resumes it from continuation tokens.
+        """
+        return cls(schema, producer.batches(), rows_affected, producer)
 
     def close(self) -> None:
         """Call the batch iterator's close method when available."""

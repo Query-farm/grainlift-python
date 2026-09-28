@@ -118,6 +118,48 @@ Return `QueryResult(schema, batch_iterator)` for queries and metadata. Iterators
 should expose `close()` to release resources. Generate bounded batches lazily,
 and preserve the same schema, including metadata, throughout each result.
 
+### Serializable results
+
+Instead of an iterator, a result can be a `ResultProducer`: a dataclass whose
+fields are the complete resumable state, with a `produce()` method that returns
+the next batch or `None`. Over HTTP the service serializes the producer into the
+encrypted, principal-bound continuation token after every batch, which is the
+same mechanism VGI-RPC streams use. The server therefore retains no iterator or
+replay batch between fetches, and a retried fetch recomputes its batch from the
+token. Process isolation and TCP drive the same object in memory.
+
+```python
+from dataclasses import dataclass
+
+from grainlift import QueryResult, ResultProducer
+
+@dataclass
+class Countdown(ResultProducer):
+    remaining: int
+
+    def produce(self) -> pa.RecordBatch | None:
+        if self.remaining == 0:
+            return None
+        self.remaining -= 1
+        return pa.record_batch([[self.remaining]], schema=SCHEMA)
+
+# In Statement.execute():
+return QueryResult.from_producer(SCHEMA, Countdown(3))
+```
+
+Fields must be Arrow-serializable, and `Limits.producer_state_bytes` (64 KiB by
+default) bounds the encoded state. Keep sockets, files and backend cursors out
+of producers; use an iterator for those results. Sessions, and therefore result
+handles, still belong to one process, so producers do not make results survive
+a restart.
+
+### Development host
+
+`grainlift serve module:Factory` (or `grainlift.cli.run("module:Factory")` from
+your own console script) serves a worker on loopback with `--host waitress`,
+`granian` or `mtls`. HTTP hosts read the bearer token from `GRAINLIFT_TOKEN`,
+or generate and print one when it is unset.
+
 ## Lifecycle and resource contract
 
 Each service owns its sessions in one process. Route all calls, including

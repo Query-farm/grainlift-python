@@ -2,7 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python-authored ADBC services, accessed with the Grainlift native driver."""
 
-from .api import AdbcError, Connection, Limits, OptionValue, PartitionedResult, QueryResult, Statement, Worker
+from .api import (
+    AdbcError,
+    Connection,
+    Limits,
+    OptionValue,
+    PartitionedResult,
+    QueryResult,
+    ResultProducer,
+    Statement,
+    Worker,
+)
 from .credentials import TokenStore
 from .hosting import serve_granian
 from .isolation import IsolatedWorker
@@ -17,6 +27,7 @@ __all__ = [
     "OptionValue",
     "PartitionedResult",
     "QueryResult",
+    "ResultProducer",
     "Service",
     "Statement",
     "TokenStore",

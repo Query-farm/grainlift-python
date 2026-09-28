@@ -23,7 +23,7 @@ from vgi_rpc.http import make_wsgi_app
 from vgi_rpc.utils import ArrowSerializableDataclass, serialize_record_batch_bytes
 
 from . import protocol as p
-from .api import AdbcError, Connection, Limits, OptionValue, QueryResult, Statement, Worker
+from .api import AdbcError, Connection, Limits, OptionValue, QueryResult, ResultProducer, Statement, Worker
 from .binding import BindUpload, decode_batch, decode_schema
 from .credentials import TokenStore
 from .options import WireOptionValue, configured_options, option_mapping, validate_key
@@ -92,6 +92,7 @@ def guarded[**P, T](method: Callable[Concatenate[Service, P], T]) -> Callable[Co
 @dataclass
 class _Result:
     query: QueryResult
+    producer: bytes | None = None
     sequence: int = 0
     last: pa.RecordBatch | None = None
     finished: bool = False
@@ -348,9 +349,17 @@ class Service:
             raise AdbcError("Invalid affected row count", "invalid_data")
         return value
 
+    def _encoded_producer(self, producer: ResultProducer) -> bytes:
+        encoded = producer.encode()
+        if len(encoded) > self.limits.producer_state_bytes:
+            raise AdbcError("Result producer state exceeds configured limit", "invalid_data")
+        return encoded
+
     def _register_result(self, session: _Session, query: QueryResult) -> p.ExecuteResponse:
         result = _Result(query)
         try:
+            if query.producer is not None:
+                result.producer = self._encoded_producer(query.producer)
             self._ensure_result_slot(session)
             encoded = self._encoded_schema(query.schema)
             rid = secrets.token_urlsafe(24)
@@ -471,7 +480,12 @@ class Service:
         result = session.results.get(result_id)
         if result is None:
             raise AdbcError("Result is unavailable", "not_found")
-        return Stream(output_schema=result.query.schema, state=p.ResultCursor(session_id, result_id, sequence))
+        if result.producer is not None and sequence != 0:
+            raise AdbcError("Producer results resume from continuation tokens", "invalid_arguments")
+        return Stream(
+            output_schema=result.query.schema,
+            state=p.ResultCursor(session_id, result_id, sequence, result.producer),
+        )
 
     @guarded
     def next_batch(self, session_id: str, result_id: str, sequence: int, ctx: CallContext) -> pa.RecordBatch | None:
@@ -503,6 +517,51 @@ class Service:
         except Exception:
             session.results.pop(result_id).close()
             raise
+
+    @guarded
+    def next_produced_batch(
+        self, session_id: str, result_id: str, sequence: int, state: bytes, ctx: CallContext
+    ) -> tuple[pa.RecordBatch | None, bytes]:
+        """Resume a producer from token state, fetch one batch, and return the advanced state.
+
+        Replaying the previous sequence re-produces its batch from the token's
+        state instead of retaining the batch in memory.
+
+        Args:
+            session_id: Owning session handle.
+            result_id: Result handle within the session.
+            sequence: Batch index the token's state produces next.
+            state: Encoded producer from the continuation token.
+            ctx: Authenticated call context.
+
+        Returns:
+            The batch, or None at end of result, and the state for the following token.
+        """
+        session = self._session(session_id, ctx)
+        result = session.results.get(result_id)
+        if result is None or result.producer is None:
+            raise AdbcError("Result is unavailable", "not_found")
+        result.touched = time.monotonic()
+        if sequence not in (result.sequence, result.sequence - 1):
+            raise AdbcError("Invalid result sequence", "invalid_arguments")
+        if result.finished and sequence == result.sequence:
+            return None, state
+        try:
+            producer = ResultProducer.decode(state)
+            batch = producer.produce()
+            if batch is None:
+                result.finished = True
+                return None, state
+            if not batch.schema.equals(result.query.schema, check_metadata=True):
+                raise AdbcError("Result schema changed", "invalid_data")
+            if batch.get_total_buffer_size() > self.limits.batch_bytes:
+                raise AdbcError("Result batch exceeds configured limit", "invalid_data")
+            advanced = self._encoded_producer(producer)
+        except Exception:
+            session.results.pop(result_id).close()
+            raise
+        result.sequence = max(result.sequence, sequence + 1)
+        return batch, advanced
 
     @guarded
     def close_result(self, session_id: str, result_id: str, ctx: CallContext) -> p.OkResponse:

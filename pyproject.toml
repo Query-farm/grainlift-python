@@ -10,6 +10,9 @@ dependencies = ["vgi-rpc[http]>=0.47.1", "pyarrow>=19"]
 [project.optional-dependencies]
 granian = ["granian>=2.8.3,<2.9"]
 
+[project.scripts]
+grainlift = "grainlift.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -151,15 +151,25 @@ def schema_ipc(value: pa.Schema) -> bytes:
 
 @dataclass
 class ResultCursor(ProducerState):
-    """Serializable handle cursor; the actual iterator remains in the service."""
+    """Serializable handle cursor.
+
+    Iterator results remain in the service. For ResultProducer results, the
+    encoded producer travels here, inside the encrypted continuation token.
+    """
 
     session_id: str
     result_id: str
     sequence: int
+    producer: bytes | None = None
 
     def produce(self, out: OutputCollector, ctx: CallContext) -> None:
         """Emit one batch or finish the pull stream at end of results."""
-        batch = ctx.implementation.next_batch(self.session_id, self.result_id, self.sequence, ctx)
+        if self.producer is None:
+            batch = ctx.implementation.next_batch(self.session_id, self.result_id, self.sequence, ctx)
+        else:
+            batch, self.producer = ctx.implementation.next_produced_batch(
+                self.session_id, self.result_id, self.sequence, self.producer, ctx
+            )
         if batch is None:
             out.finish()
         else:
