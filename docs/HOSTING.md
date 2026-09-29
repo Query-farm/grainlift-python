@@ -122,7 +122,7 @@ applications retain their logging configuration.
 
 ## Granian HTTP
 
-Install `grainlift-python[granian]`, then call the public entry point from a main
+Install `grainlift[granian]`, then call the public entry point from a main
 guard. The factory must be an importable `module:attribute` returning a Worker.
 It runs in the serving child, never in the supervisor. Worker options must be
 picklable; do not pass a live Service or database connection across processes.

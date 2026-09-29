@@ -93,7 +93,7 @@ def serve_granian(
         from granian.constants import HTTPModes, Interfaces
         from granian.http import HTTP1Settings
     except ImportError:
-        raise ImportError("Install grainlift-python[granian] to use serve_granian") from None
+        raise ImportError("Install grainlift[granian] to use serve_granian") from None
 
     server = Granian(
         "grainlift.hosting",

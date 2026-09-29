@@ -1,4 +1,4 @@
-# grainlift-python
+# grainlift
 
 Build ADBC services in Python. Applications load the existing native Grainlift
 ADBC driver; your worker supplies query behavior and lazy Arrow batches over
@@ -21,12 +21,11 @@ use `autocommit=True` with the Python ADBC driver manager.
 
 Python 3.13 or newer is required.
 
-    pip install grainlift-python
+    pip install grainlift
 
-The distribution is named `grainlift-python`; import it as `grainlift`. To use the
-optional supervised Granian HTTP host, install the `granian` extra:
+To use the optional supervised Granian HTTP host, install the `granian` extra:
 
-    pip install "grainlift-python[granian]"
+    pip install "grainlift[granian]"
 
 This package is the service side only. Client applications connect through the
 native [Grainlift ADBC driver](https://github.com/Query-farm/grainlift), which must
@@ -37,7 +36,7 @@ speak the same Grainlift protocol version (0.4.0).
 `TcpServer` provides bounded TCP/mTLS admission, verified certificate URI identity,
 read/write deadlines and explicit draining/shutdown. Plain TCP requires an
 explicit local principal and a loopback bind address. `serve_granian` is an
-optional supervised HTTP host; install `grainlift-python[granian]`. It creates
+optional supervised HTTP host; install `grainlift[granian]`. It creates
 the worker inside one serving process and preserves ADBC session affinity.
 The existing `serve()` Waitress entry point remains available.
 
