@@ -34,7 +34,9 @@ compiled `libadbc_driver_grainlift` shared library (CI builds it from a pinned
 - `protocol.py`, `requests.py`, `wire.py`, `options.py`, `tokens.py`, `binding.py`
   — typed wire contract, request records, option codecs, signed partition claims,
   upload staging.
-- `cli.py` — `grainlift serve module:Factory` development CLI.
+- `cli.py` — development CLI: `run()` for a worker's own console script, or
+  `python -m grainlift.cli serve module:Factory`. The package installs no
+  console script of its own, to avoid colliding with other `grainlift` commands.
 - `docs/API.md`, `docs/HOSTING.md` — API contract and hosting guide.
 
 Public exports live in `src/grainlift/__init__.py`; keep `__all__` in sync.

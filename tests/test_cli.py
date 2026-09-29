@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The development CLI: factory loading, token generation, and anonymous access."""
 
+import subprocess
+import sys
+from importlib.metadata import distribution
 from typing import Any
 
 import pytest
@@ -79,3 +82,17 @@ def test_invalid_factories_and_options(served: dict[str, Any]) -> None:
         run("test_service:TestWorker", ["--host", "mtls"])
     with pytest.raises(ValueError, match="auth must be"):
         run("test_service:TestWorker", [], auth="none")
+
+
+def test_module_entry_point_and_no_console_script() -> None:
+    """The CLI runs as ``python -m grainlift.cli``; the package claims no command name of its own."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "grainlift.cli", "serve", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    assert "usage: python -m grainlift.cli serve" in completed.stdout
+    assert "--auth" in completed.stdout
+    assert [entry for entry in distribution("grainlift").entry_points if entry.group == "console_scripts"] == []

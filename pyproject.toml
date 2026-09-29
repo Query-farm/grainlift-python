@@ -1,6 +1,6 @@
 [project]
 name = "grainlift"
-version = "0.2.0"
+version = "0.2.1"
 description = "Build ADBC services in Python with Grainlift and VGI-RPC"
 requires-python = ">=3.13"
 license = "Apache-2.0"
@@ -30,9 +30,6 @@ Issues = "https://github.com/Query-farm/grainlift-python/issues"
 
 [project.optional-dependencies]
 granian = ["granian>=2.8.3,<2.9"]
-
-[project.scripts]
-grainlift = "grainlift.cli:main"
 
 [build-system]
 requires = ["hatchling"]

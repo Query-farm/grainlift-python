@@ -1,6 +1,10 @@
 # Copyright (c) 2026 Query Farm LLC
 # SPDX-License-Identifier: Apache-2.0
-"""Command-line hosting for a worker factory: ``grainlift serve module:Factory``."""
+"""Development hosting for a worker: ``run()`` for your own command, or ``python -m grainlift.cli serve``.
+
+The toolkit installs no console script of its own. Give each worker its own
+command by calling [`run`][grainlift.cli.run] from a ``[project.scripts]`` entry.
+"""
 
 from __future__ import annotations
 
@@ -133,12 +137,12 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, factory
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Entry point for ``grainlift serve module:factory``.
+    """Entry point for ``python -m grainlift.cli serve module:factory``.
 
     Args:
         argv: Command-line arguments; defaults to ``sys.argv[1:]``.
     """
-    parser = argparse.ArgumentParser(prog="grainlift", description="Grainlift worker tools")
+    parser = argparse.ArgumentParser(prog="python -m grainlift.cli", description="Grainlift worker tools")
     commands = parser.add_subparsers(dest="command", required=True)
     serve_parser = commands.add_parser(
         "serve",
@@ -148,3 +152,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
     _dispatch(serve_parser, args, args.factory)
+
+
+if __name__ == "__main__":
+    main()

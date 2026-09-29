@@ -144,8 +144,9 @@ a restart.
 
 ### Development host
 
-`grainlift serve module:Factory` (or `grainlift.cli.run("module:Factory")` from
-your own console script) serves a worker on loopback with `--host waitress`,
+Call `grainlift.cli.run("module:Factory")` from your own console script to give a
+worker its own command, or use `python -m grainlift.cli serve module:Factory`
+without writing one. Either serves the worker on loopback with `--host waitress`,
 `granian` or `mtls`. HTTP hosts read the bearer token from `GRAINLIFT_TOKEN`,
 or generate and print one when it is unset.
 
@@ -167,7 +168,7 @@ capabilities: the toolkit does not decide which statements are read-only, and
 the worker can check the `principal` passed to `Worker.connect`. Anonymous
 continuation tokens are sealed in a separate authentication domain, and the
 anonymous principal must differ from every token principal. `serve()`,
-`serve_granian()` and `grainlift serve --auth anonymous` accept the same option.
+`serve_granian()` and the development CLI's `--auth anonymous` accept the same option.
 
 ## Lifecycle and resource contract
 
