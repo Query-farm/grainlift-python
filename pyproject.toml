@@ -1,11 +1,32 @@
 [project]
 name = "grainlift-python"
-version = "0.1.0"
+version = "0.2.0"
 description = "Build ADBC services in Python with Grainlift and VGI-RPC"
 requires-python = ">=3.13"
 license = "Apache-2.0"
 readme = "README.md"
+authors = [{ name = "Rusty Conover", email = "rusty@query.farm" }]
+keywords = ["adbc", "arrow", "grainlift", "vgi-rpc", "database", "rpc"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = ["vgi-rpc[http]>=0.47.1", "pyarrow>=19"]
+
+[project.urls]
+Homepage = "https://github.com/Query-farm/grainlift-python"
+Repository = "https://github.com/Query-farm/grainlift-python"
+Documentation = "https://github.com/Query-farm/grainlift-python/blob/main/docs/API.md"
+Issues = "https://github.com/Query-farm/grainlift-python/issues"
 
 [project.optional-dependencies]
 granian = ["granian>=2.8.3,<2.9"]

@@ -318,7 +318,7 @@ wheels = [
 
 [[package]]
 name = "grainlift-python"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "pyarrow" },
@@ -924,7 +924,7 @@ wheels = [
 
 [[package]]
 name = "vgi-rpc"
-version = "0.47.1"
+version = "0.47.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "docstring-parser" },
@@ -932,9 +932,9 @@ dependencies = [
     { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/66/e9/7509cc8cadf63dec8cd6b9419c75dfae76dea7f76d5430def97c94761f89/vgi_rpc-0.47.1.tar.gz", hash = "sha256:d5c1801c088907693cf937abc7a5e47121a43d92d56517bd32ad4fd96db54850", size = 1505659, upload-time = "2026-09-18T20:51:30.211Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/0a/c38719a918a3e5e8e8f9f180c09b1f2d8c70c53e98351471122786b2fe55/vgi_rpc-0.47.2.tar.gz", hash = "sha256:ec5d9a0425509b8f6180cf4fa1634e6bf6ad88a00faae117ea7ef2a3b4d44510", size = 1493865, upload-time = "2026-09-27T17:48:42.044Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/a1/b0aea7a28414b6e1b060d7157ddc49e550f7af6b40383e935ec4c9aa610f/vgi_rpc-0.47.1-py3-none-any.whl", hash = "sha256:f0b9884358a6df7cf3c6df04d889045853f0d791d3dc5f6783e5ea28c1e18b54", size = 696128, upload-time = "2026-09-18T20:51:28.143Z" },
+    { url = "https://files.pythonhosted.org/packages/83/ef/cdb36d2bf1ed827931238ce16145bbfc15ea460b88c62b048fdc51d4ba90/vgi_rpc-0.47.2-py3-none-any.whl", hash = "sha256:92e05dc90d1724ee345b3fbcfcb4d44925dcd8132d18d9c8f5abe0ba372edbd7", size = 696129, upload-time = "2026-09-27T17:48:39.46Z" },
 ]
 
 [package.optional-dependencies]

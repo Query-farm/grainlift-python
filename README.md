@@ -17,30 +17,20 @@ Existing `Connection.execute(sql)` workers remain supported through a statement
 adapter. Those workers retain their original query-only capabilities and should
 use `autocommit=True` with the Python ADBC driver manager.
 
-## Development
+## Installation
 
-Python 3.13+ and [uv](https://docs.astral.sh/uv/) are required. Clone this repository
-and run:
+Python 3.13 or newer is required.
 
-    uv sync --locked --extra granian
-    ./check_quality.sh
-    uv run --no-sync pytest
+    pip install grainlift-python
 
-The toolkit uses published `vgi-rpc[http]>=0.47.1`; the lockfile pins its index
-release and dependencies. No modified VGI runtime is required. Unary service
-methods return frozen typed response dataclasses, which VGI serializes through
-its standard binary result envelope. Opening connections, setting options, and
-filtered metadata discovery use named request dataclasses with native Arrow
-fields. Option values use a nested typed record, and partition descriptors use
-an Arrow binary list with signed typed claims. Parameter uploads use a
-fixed one-row envelope so empty and zero-column Arrow data remain unambiguous.
-Protocol 0.4.0 requires a matching Grainlift client; earlier wire clients must be
-upgraded together with the service. See [the API guide](docs/API.md) for details.
+The distribution is named `grainlift-python`; import it as `grainlift`. To use the
+optional supervised Granian HTTP host, install the `granian` extra:
 
-The CI workflow checks Linux/macOS with Python 3.13/3.14, runs Ruff, formatting,
-strict mypy and isolated pydoclint, then installs the built wheel and runs its
-tests. A configured workflow is not evidence that every matrix job has passed;
-consult the repository's Actions results for the revision being deployed.
+    pip install "grainlift-python[granian]"
+
+This package is the service side only. Client applications connect through the
+native [Grainlift ADBC driver](https://github.com/Query-farm/grainlift), which must
+speak the same Grainlift protocol version (0.4.0).
 
 ## Hosting
 
@@ -65,7 +55,7 @@ with TcpServer(Service(AnswerWorker()), host="0.0.0.0", port=8443, tls=tls) as h
     shutdown_event.wait()  # Your process supervisor signals this event.
 ```
 
-See [hosting and lifecycle configuration](docs/HOSTING.md) for a complete
+See [hosting and lifecycle configuration](https://github.com/Query-farm/grainlift-python/blob/main/docs/HOSTING.md) for a complete
 signal-handling example, Granian deployment, limits, credential rotation and
 the distinction between draining, forced transport shutdown and worker cleanup.
 
@@ -76,7 +66,7 @@ for a complete worker and ordinary ADBC client.
 
 Override `Connection.new_statement()` to create independent backend statements.
 This small example implements one query; add only capabilities the backend can
-perform correctly. See [the API contract](docs/API.md) for every hook.
+perform correctly. See [the API contract](https://github.com/Query-farm/grainlift-python/blob/main/docs/API.md) for every hook.
 
 ```python
 import pyarrow as pa
@@ -251,7 +241,7 @@ The CLI binds to loopback and requires a bearer token. For deployment, host
 Service.app(tokens={token: principal}) behind HTTPS and enforce process affinity.
 Do not expose plain HTTP with bearer tokens on an untrusted network.
 The supported TCP and mTLS hosts have explicit admission, I/O, and shutdown
-bounds; see [hosting](docs/HOSTING.md). Iroh serving is not implemented here.
+bounds; see [hosting](https://github.com/Query-farm/grainlift-python/blob/main/docs/HOSTING.md). Iroh serving is not implemented here.
 
 The WSGI wrapper filters VGI-RPC transport logs during Grainlift requests because
 diagnostics can contain SQL, credentials, Arrow values, and raw exceptions. It
@@ -331,7 +321,7 @@ stream cancellation, invalid schemas, and limits below, at, and above boundaries
 Focused feature tests cover typed options, authoritative configuration,
 metadata filters and quotas, statement hooks, transactions, binding replay and
 spool cleanup, and signed partition ownership. Isolated-worker and native-driver
-fixtures exercise backend delegation separately; see [the API coverage map](docs/API.md).
+fixtures exercise backend delegation separately; see [the API coverage map](https://github.com/Query-farm/grainlift-python/blob/main/docs/API.md).
 
 The wire preserves vendor_code, but the current Rust adbc_ffi dependency in
 Grainlift overwrites the C error's vendor-code slot with the ADBC 1.1 private-data
@@ -339,3 +329,28 @@ sentinel. Consequently adbc-driver-manager 1.12.0 exposes vendor_code=None in th
 tests, even when the worker sent a code. Status, SQLSTATE, and binary details
 survive. This is an existing native-client limitation, not a claim of complete
 end-to-end error fidelity.
+
+## Development
+
+Python 3.13+ and [uv](https://docs.astral.sh/uv/) are required. Clone this repository
+and run:
+
+    uv sync --locked --extra granian
+    ./check_quality.sh
+    uv run --no-sync pytest
+
+The toolkit uses published `vgi-rpc[http]>=0.47.1`; the lockfile pins its index
+release and dependencies. No modified VGI runtime is required. Unary service
+methods return frozen typed response dataclasses, which VGI serializes through
+its standard binary result envelope. Opening connections, setting options, and
+filtered metadata discovery use named request dataclasses with native Arrow
+fields. Option values use a nested typed record, and partition descriptors use
+an Arrow binary list with signed typed claims. Parameter uploads use a
+fixed one-row envelope so empty and zero-column Arrow data remain unambiguous.
+Protocol 0.4.0 requires a matching Grainlift client; earlier wire clients must be
+upgraded together with the service. See [the API guide](https://github.com/Query-farm/grainlift-python/blob/main/docs/API.md) for details.
+
+The CI workflow checks Linux/macOS with Python 3.13/3.14, runs Ruff, formatting,
+strict mypy and isolated pydoclint, then installs the built wheel and runs its
+tests. A configured workflow is not evidence that every matrix job has passed;
+consult the repository's Actions results for the revision being deployed.
