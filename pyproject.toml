@@ -1,6 +1,6 @@
 [project]
 name = "grainlift"
-version = "0.3.0"
+version = "0.3.1"
 description = "Build ADBC services in Python with Grainlift and VGI-RPC"
 requires-python = ">=3.13"
 license = "Apache-2.0"
