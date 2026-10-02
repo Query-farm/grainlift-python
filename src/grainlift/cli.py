@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from .api import Worker
 from .hosting import serve_granian
 from .server import Service, serve
+from .storage import ExternalStorageConfig
 from .tcp import TcpServer, TLSConfig
 
 TOKEN_VARIABLE = "GRAINLIFT_TOKEN"
@@ -66,7 +67,36 @@ def _parser(description: str | None, *, with_factory: bool, auth: str = "token")
     tls.add_argument("--tls-key", help="server private key (PEM)")
     tls.add_argument("--client-ca", help="CA that issues client certificates (PEM)")
     tls.add_argument("--client-uri", help="authorized client certificate URI SAN")
+    storage = parser.add_argument_group(
+        "external storage (HTTP hosts)",
+        "S3-compatible bucket for requests over the request limit and large results; "
+        "credentials come from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+    )
+    storage.add_argument("--storage-endpoint", help="S3 API endpoint, e.g. https://<account>.r2.cloudflarestorage.com")
+    storage.add_argument("--storage-bucket", help="bucket name")
+    storage.add_argument("--storage-region", default="auto", help="signing region (default: auto, for R2)")
+    storage.add_argument("--storage-prefix", default="", help="key prefix for stored objects")
     return parser
+
+
+def _external_storage(parser: argparse.ArgumentParser, args: argparse.Namespace) -> ExternalStorageConfig | None:
+    if args.storage_endpoint is None and args.storage_bucket is None:
+        return None
+    if not (args.storage_endpoint and args.storage_bucket):
+        parser.error("external storage needs both --storage-endpoint and --storage-bucket")
+    if args.host == "mtls":
+        parser.error("external storage applies to the HTTP hosts only")
+    try:
+        config = ExternalStorageConfig(
+            endpoint=args.storage_endpoint,
+            bucket=args.storage_bucket,
+            region=args.storage_region,
+            prefix=args.storage_prefix,
+        )
+        config.credentials()
+    except ValueError as error:
+        parser.error(str(error))
+    return config
 
 
 def _http_access(auth: str) -> tuple[dict[str, str] | None, str | None]:
@@ -124,16 +154,19 @@ def run(
 
 
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace, factory: str) -> None:
+    storage = _external_storage(parser, args)
     if args.host == "mtls":
         _serve_mtls(parser, args, factory)
     elif args.host == "granian":
         tokens, anonymous = _http_access(args.auth)
         print(f"Grainlift listening on http://127.0.0.1:{args.port}", flush=True)
-        serve_granian(factory, tokens=tokens, anonymous_principal=anonymous, port=args.port)
+        serve_granian(factory, tokens=tokens, anonymous_principal=anonymous, port=args.port, external_storage=storage)
     else:
         tokens, anonymous = _http_access(args.auth)
         token = next(iter(tokens)) if tokens else None
-        serve(load_worker(factory), token=token, anonymous_principal=anonymous, port=args.port)
+        serve(
+            load_worker(factory), token=token, anonymous_principal=anonymous, port=args.port, external_storage=storage
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> None:

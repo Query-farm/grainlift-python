@@ -28,6 +28,7 @@ from .binding import BindUpload, decode_batch, decode_schema
 from .credentials import TokenStore
 from .options import WireOptionValue, configured_options, option_mapping, validate_key
 from .requests import Request
+from .storage import ExternalStorageConfig
 from .telemetry import PrivateApplication
 from .tokens import PartitionClaims, seal_partition, unseal_partition
 
@@ -184,6 +185,9 @@ class Service:
         """
         self.worker = worker
         self.limits = limits or Limits()
+        # Upload cap of external storage (``app(external_storage=...)``), through
+        # which a bind frame may arrive instead of in one request.
+        self._external_upload_bytes = 0
         self._database_options = configured_options(database_options, self.limits.request_bytes)
         self._connection_options = configured_options(connection_options, self.limits.request_bytes)
         self._partition_key = secrets.token_bytes(32)
@@ -853,6 +857,14 @@ class Service:
         """Begin a bounded Arrow stream exchange backed by an anonymous temporary file."""
         return self._start_binding(session_id, statement_id, schema_ipc, True, ctx)
 
+    def _bind_frame_bytes(self) -> int:
+        """Largest bind frame: one request, or an upload through external storage.
+
+        Returns:
+            The byte limit.
+        """
+        return max(self.limits.request_bytes, self._external_upload_bytes)
+
     @guarded
     def push_binding_frame(
         self,
@@ -874,7 +886,7 @@ class Service:
                 not frame.schema.equals(p.BIND_INPUT, check_metadata=True)
                 or frame.num_rows != 1
                 or any(column.null_count for column in frame.columns)
-                or frame.get_total_buffer_size() > self.limits.request_bytes
+                or frame.get_total_buffer_size() > self._bind_frame_bytes()
             ):
                 raise AdbcError("Invalid bind envelope", "invalid_arguments")
             payload = frame.column("batch_ipc")[0].as_py()
@@ -884,7 +896,7 @@ class Service:
                     raise AdbcError("Bind finish payload must be empty", "invalid_arguments")
                 batch = pa.RecordBatch.from_pylist([], schema=upload.schema)
             else:
-                batch = decode_batch(payload, self.limits.request_bytes)
+                batch = decode_batch(payload, self._bind_frame_bytes())
             self.push_binding(session_id, statement_id, upload_id, sequence, batch, finish, ctx)
         except Exception:
             if pending:
@@ -936,7 +948,11 @@ class Service:
             self._discard_upload(statement)
 
     def app(
-        self, *, tokens: dict[str, str] | TokenStore | None = None, anonymous_principal: str | None = None
+        self,
+        *,
+        tokens: dict[str, str] | TokenStore | None = None,
+        anonymous_principal: str | None = None,
+        external_storage: ExternalStorageConfig | None = None,
     ) -> PrivateApplication:
         """Create the WSGI app, authenticating bearer tokens and optionally anonymous requests.
 
@@ -950,11 +966,15 @@ class Service:
         Args:
             tokens: Bearer secrets mapped to principals; optional when anonymous access is enabled.
             anonymous_principal: Principal for requests without credentials; None requires a token.
+            external_storage: Bucket for requests over the request limit and large result batches.
 
         Returns:
             The WSGI application.
         """
         credentials = access_credentials(tokens, anonymous_principal)
+        external, upload_urls = external_storage.server_config() if external_storage is not None else (None, None)
+        if external_storage is not None:
+            self._external_upload_bytes = external_storage.max_upload_bytes
 
         def authenticate(req: falcon.Request) -> AuthContext:
             supplied = req.get_header("Authorization")
@@ -967,7 +987,7 @@ class Service:
             raise ValueError("Authentication required")
 
         app = make_wsgi_app(
-            RpcServer(p.Grainlift, self),
+            RpcServer(p.Grainlift, self, external_location=external),
             token_key=secrets.token_bytes(32),
             authenticate=authenticate,
             max_request_bytes=self.limits.request_bytes,
@@ -975,6 +995,8 @@ class Service:
             token_ttl=max(1, int(self.limits.idle_seconds)),
             enable_landing_page=False,
             enable_describe_page=False,
+            upload_url_provider=upload_urls,
+            max_upload_bytes=external_storage.max_upload_bytes if external_storage is not None else None,
         )
         return PrivateApplication(app)
 
@@ -1010,6 +1032,7 @@ def serve(
     port: int = 8080,
     limits: Limits | None = None,
     anonymous_principal: str | None = None,
+    external_storage: ExternalStorageConfig | None = None,
 ) -> None:
     """Serve on loopback. Deployment behind TLS requires a process-affine WSGI host.
 
@@ -1019,11 +1042,16 @@ def serve(
         port: Loopback port.
         limits: ADBC quotas and cleanup deadlines.
         anonymous_principal: Principal for requests without credentials; None requires the token.
+        external_storage: Bucket for requests over the request limit and large result batches.
     """
     import waitress
 
     with Service(worker, limits=limits) as service:
-        app = service.app(tokens={token: "developer"} if token else None, anonymous_principal=anonymous_principal)
+        app = service.app(
+            tokens={token: "developer"} if token else None,
+            anonymous_principal=anonymous_principal,
+            external_storage=external_storage,
+        )
         print(f"Grainlift target {worker.target!r} listening on http://127.0.0.1:{port}", flush=True)
         # Waitress rejects Content-Length >= its cap; the SDK rejects > its cap.
         # Translate the host boundary while retaining the exact application limit.

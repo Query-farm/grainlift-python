@@ -14,7 +14,7 @@ database semantics. It speaks Grainlift protocol **0.4.0**
 
 ## Commands
 
-    uv sync --locked --extra granian   # set up the environment (Python 3.13+)
+    uv sync --locked --extra granian --extra storage   # set up the environment (Python 3.13+)
     ./check_quality.sh                 # ruff check, ruff format --check, strict mypy, pydoclint
     uv run --no-sync pytest            # full test suite
     uv build                           # sdist + wheel via hatchling
@@ -30,6 +30,8 @@ compiled `libadbc_driver_grainlift` shared library (CI builds it from a pinned
 - `server.py` — `Service`, sessions, authenticated WSGI app, `serve()` (Waitress).
 - `tcp.py` — `TcpServer`/`TLSConfig`: bounded TCP/mTLS hosting.
 - `hosting.py` — optional `serve_granian` (needs the `granian` extra).
+- `storage.py` — `ExternalStorageConfig`: S3-compatible bucket for large requests and
+  results (VGI-RPC external locations, SigV4 presigned URLs); needs the `storage` extra.
 - `isolation.py` — `IsolatedWorker`, process-per-connection execution.
 - `protocol.py`, `requests.py`, `wire.py`, `options.py`, `tokens.py`, `binding.py`
   — typed wire contract, request records, option codecs, signed partition claims,

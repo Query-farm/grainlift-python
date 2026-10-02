@@ -12,6 +12,7 @@ from typing import Any
 
 from .api import Limits, Worker
 from .server import Service, access_credentials
+from .storage import ExternalStorageConfig
 from .telemetry import PrivateApplication
 
 
@@ -21,6 +22,7 @@ def _load(
     tokens: dict[str, str] | None,
     limits: Limits,
     anonymous_principal: str | None = None,
+    external_storage: ExternalStorageConfig | None = None,
 ) -> PrivateApplication:
     module, _, name = factory.partition(":")
     worker = getattr(importlib.import_module(module), name)(**options)
@@ -36,7 +38,9 @@ def _load(
             logging.getLogger("grainlift.host").error("Grainlift worker cleanup did not complete")
 
     try:
-        application = service.app(tokens=tokens, anonymous_principal=anonymous_principal)
+        application = service.app(
+            tokens=tokens, anonymous_principal=anonymous_principal, external_storage=external_storage
+        )
         # Spawned workers bypass atexit; multiprocessing finalizers still run on
         # orderly exit. The supervisor forcibly terminates a worker past its deadline.
         Finalize(None, finish, exitpriority=10)
@@ -57,6 +61,7 @@ def serve_granian(
     shutdown_seconds: int = 15,
     limits: Limits | None = None,
     anonymous_principal: str | None = None,
+    external_storage: ExternalStorageConfig | None = None,
 ) -> None:
     """Serve authenticated loopback HTTP with Granian's process supervisor.
 
@@ -76,6 +81,7 @@ def serve_granian(
         shutdown_seconds: Supervisor grace period before forced process termination.
         limits: ADBC quotas and backend cleanup deadlines.
         anonymous_principal: Principal for requests without credentials; None requires a token.
+        external_storage: Bucket for requests over the request limit and large result batches.
     """
     if not factory.partition(":")[0] or not factory.partition(":")[2]:
         raise ValueError("Worker factory must use module:factory syntax")
@@ -119,6 +125,7 @@ def serve_granian(
             dict(tokens) if tokens is not None else None,
             service_limits,
             anonymous_principal,
+            external_storage,
         ),
         wrap_loader=False,
     )

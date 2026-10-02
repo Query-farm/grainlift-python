@@ -17,11 +17,13 @@ from .credentials import TokenStore
 from .hosting import serve_granian
 from .isolation import IsolatedWorker
 from .server import Service, serve
+from .storage import ExternalStorageConfig
 from .tcp import TcpLimits, TcpServer, TLSConfig
 
 __all__ = [
     "AdbcError",
     "Connection",
+    "ExternalStorageConfig",
     "IsolatedWorker",
     "Limits",
     "OptionValue",

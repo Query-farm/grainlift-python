@@ -27,6 +27,11 @@ To use the optional supervised Granian HTTP host, install the `granian` extra:
 
     pip install "grainlift[granian]"
 
+To send large requests and results through S3-compatible object storage, install
+the `storage` extra:
+
+    pip install "grainlift[storage]"
+
 This package is the service side only. Client applications connect through the
 native [Grainlift ADBC driver](https://github.com/Query-farm/grainlift), which must
 speak the same Grainlift protocol version (0.4.0).
@@ -169,6 +174,45 @@ the worker can check the `principal` passed to `Worker.connect`. Anonymous
 continuation tokens are sealed in a separate authentication domain, and the
 anonymous principal must differ from every token principal. `serve()`,
 `serve_granian()` and the development CLI's `--auth anonymous` accept the same option.
+
+### Large requests and results: object storage
+
+Over HTTP, a request is limited to `Limits.request_bytes`, so a parameter row
+larger than that cannot be bound. With an `ExternalStorageConfig`, the HTTP
+host uses an S3-compatible bucket (AWS S3, Cloudflare R2, MinIO) for
+[VGI-RPC external locations](https://vgi-rpc.query.farm/):
+
+- A client whose request is over the limit asks the host for an upload URL
+  (`POST /__upload_url__/init`), PUTs the request to the bucket and sends only a
+  pointer, up to `max_upload_bytes`.
+- A result batch of at least `threshold_bytes` is stored in the bucket and the
+  client is sent a URL to fetch it.
+
+The host presigns the URLs itself (AWS Signature Version 4), so clients need no
+storage credentials and no AWS SDK is installed; it fetches only objects in its
+own bucket. It needs the `storage` extra.
+
+```python
+from grainlift import ExternalStorageConfig
+
+storage = ExternalStorageConfig(
+    endpoint="https://<account-id>.r2.cloudflarestorage.com",  # or https://s3.<region>.amazonaws.com
+    bucket="grainlift-exchange",
+    region="auto",          # the signing region; "auto" for R2
+    prefix="grainlift/",
+    # access_key_id / secret_access_key, or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+)
+app = service.app(tokens={token: "analyst"}, external_storage=storage)
+```
+
+`serve()` and `serve_granian()` take the same `external_storage` argument, and
+the development CLI takes `--storage-endpoint`, `--storage-bucket`,
+`--storage-region` and `--storage-prefix` (credentials from the AWS variables).
+`TcpServer` is unaffected: TCP has no request limit. The host never deletes
+objects; give the bucket a lifecycle rule that expires them (a day is plenty).
+Browser clients PUT and GET the bucket directly, so it also needs a CORS rule
+allowing `PUT` and `GET`, with the `Content-Type` and `Content-Encoding`
+headers, from the page's origin.
 
 ## Lifecycle and resource contract
 
@@ -335,7 +379,7 @@ end-to-end error fidelity.
 Python 3.13+ and [uv](https://docs.astral.sh/uv/) are required. Clone this repository
 and run:
 
-    uv sync --locked --extra granian
+    uv sync --locked --extra granian --extra storage
     ./check_quality.sh
     uv run --no-sync pytest
 

@@ -30,6 +30,8 @@ Issues = "https://github.com/Query-farm/grainlift-python/issues"
 
 [project.optional-dependencies]
 granian = ["granian>=2.8.3,<2.9"]
+# Large requests and results through S3-compatible object storage (ExternalStorageConfig).
+storage = ["vgi-rpc[external]>=0.47.1"]
 
 [build-system]
 requires = ["hatchling"]
@@ -50,7 +52,15 @@ exclude = [
 include = ["/src", "/tests", "/docs", "/README.md", "/LICENSE", "/pyproject.toml", "/check_quality.sh"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.11", "mypy>=1.15", "pyarrow-stubs", "adbc-driver-manager>=1.7", "cryptography>=45"]
+dev = [
+    "pytest>=8",
+    "ruff>=0.11",
+    "mypy>=1.15",
+    "pyarrow-stubs",
+    "adbc-driver-manager>=1.7",
+    "cryptography>=45",
+    "moto[server]>=5.1",
+]
 
 [tool.ruff]
 line-length = 120
