@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Query-farm/grainlift
-          ref: ac659c20374cd92b1874c2c2ebaeaa7ffdb4fec3
+          ref: 357b426b0a4eb0790a18ae2c96f5df72cf50f768 # v0.4.3
           path: native-driver
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
