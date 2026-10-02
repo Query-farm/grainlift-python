@@ -81,8 +81,10 @@ to the transport layer, which supplies decompressed bytes to the SDK. Extra
 batches, missing end markers, and trailing data are rejected before binding.
 Zero-row and zero-column data
 are valid data turns. `Limits.bind_bytes` includes the schema, dictionary messages,
-batches, and end-of-stream framing; `Limits.batch_bytes` independently bounds
-each batch. `bind` requires exactly one batch. `bind_stream` permits an empty
+batches, and end-of-stream framing. Each batch is bounded by what one request
+carries (`Limits.request_bytes`, or object storage's upload limit), because
+clients size bind turns from the advertised request limit; a result batch may
+be as large as `Limits.batch_bytes` or any batch a client can bind. `bind` requires exactly one batch. `bind_stream` permits an empty
 stream with a known schema. The explicit end-of-input marker is separate from
 an empty data batch and from a disconnected client.
 

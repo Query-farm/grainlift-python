@@ -252,7 +252,10 @@ logical session, so closing one socket does not implicitly destroy that session.
 
 Parameter binding uses an anonymous Arrow IPC spool with a 64 MiB cumulative
 `Limits.bind_bytes` budget, including schema, dictionaries, and stream framing.
-Each batch also obeys `Limits.batch_bytes`. `bind` accepts one batch;
+Each batch is limited by what one request carries (`Limits.request_bytes`, or
+object storage's upload limit), not by `Limits.batch_bytes`: clients size bind
+turns from the advertised request limit. A result batch may likewise be as large
+as anything a client can bind. `bind` accepts one batch;
 `bind_stream` accepts a sequence, including an empty stream with a known schema.
 An explicit finish turn distinguishes successful end-of-input from disconnect.
 The backend receives parameters only after that finish is validated.

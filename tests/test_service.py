@@ -222,7 +222,9 @@ def test_batch_limit(size: int) -> None:
         _, rid = execute(service, sid, ctx)
         result = service._sessions[sid].results[rid]
         result.query.schema = data_schema
-        service.limits = Limits(batch_bytes=16)
+        # A result batch may be as large as a bound one (up to the request
+        # limit), so both bound this boundary.
+        service.limits = Limits(batch_bytes=16, request_bytes=16)
         if size > 16:
             with pytest.raises(AdbcError, match="batch exceeds"):
                 service.next_batch(sid, rid, 0, ctx)

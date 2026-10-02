@@ -97,7 +97,10 @@ class Limits:
         results_per_session: Maximum live result handles, including metadata cursors.
         partitions_per_result: Maximum descriptors returned by partitioned execution.
         bind_bytes: Maximum cumulative serialized Arrow bytes in one parameter upload.
-        batch_bytes: Maximum batch buffer bytes and schema descriptor bytes.
+        batch_bytes: Maximum result batch buffer bytes and schema descriptor bytes. Bound parameter
+            batches are limited by ``request_bytes`` instead (or by object storage's upload limit),
+            since clients size bind turns from the advertised request limit, and a result batch may
+            be as large as any batch a client can bind.
         request_bytes: Maximum HTTP request body bytes.
         sql_bytes: Maximum UTF-8 encoded SQL bytes per statement.
         producer_state_bytes: Maximum serialized ResultProducer state carried in a continuation token.

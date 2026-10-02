@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from socketserver import ThreadingMixIn
 from typing import Any, cast
@@ -243,6 +244,10 @@ def test_native_driver_uploads_requests_and_fetches_results_through_storage(s3: 
                 connection.cursor() as cursor,
             ):
                 cursor.execute("store", rows)
+                # Consume each result. This host runs in the client's process, and
+                # replacing an unconsumed result here waits ~30 s (the driver's
+                # request timeout) before its close reaches the host; with the host
+                # in another process the close is immediate.
                 cursor.fetch_arrow_table()
                 assert sum(batch.num_rows for batch in worker.rows) == 3
                 cursor.execute("SELECT")
@@ -259,3 +264,93 @@ def test_native_driver_uploads_requests_and_fetches_results_through_storage(s3: 
     # At least one client upload (each 3 MB row exceeds the 1 MiB request limit) and one stored result.
     assert len(keys) >= 2
     assert all(key.startswith("grainlift/") and key.endswith(".arrow") for key in keys)
+
+
+@contextmanager
+def _native_host(limits: Limits, worker: Worker) -> Iterator[dict[str, str]]:
+    """Serve ``worker`` over HTTP without object storage; yield native driver options."""
+    with Service(worker, limits=limits) as service:
+        app = service.app(tokens={"token": "alice"})
+        host = make_server("127.0.0.1", 0, app, server_class=ThreadingServer, handler_class=QuietHandler)
+        thread = threading.Thread(target=host.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield {
+                "grainlift.uri": f"http://127.0.0.1:{host.server_port}",
+                "grainlift.target": "default",
+                "grainlift.auth.bearer_token": "token",
+            }
+        finally:
+            host.shutdown()
+            host.server_close()
+            thread.join(timeout=5)
+
+
+def _native_driver() -> str:
+    driver = os.environ.get("GRAINLIFT_NATIVE_DRIVER")
+    if not driver:
+        pytest.skip("Set GRAINLIFT_NATIVE_DRIVER to the compiled Grainlift shared library")
+    return driver
+
+
+def test_native_binds_are_limited_by_the_request_not_batch_bytes() -> None:
+    """A bound row that fits a request is accepted even when it exceeds ``batch_bytes``."""
+    driver = _native_driver()
+    import adbc_driver_manager.dbapi as adbc
+
+    worker = StoringWorker()
+    # batch_bytes (1 MiB) is smaller than the 3 MB row; the 4 MiB request carries it.
+    limits = Limits(request_bytes=4 * 1024 * 1024, batch_bytes=1024 * 1024)
+    with (
+        _native_host(limits, worker) as options,
+        adbc.connect(driver=driver, entrypoint="AdbcDriverGrainliftInit", db_kwargs=options, autocommit=True) as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.execute("store", pa.record_batch([pa.array([7]), pa.array(["x" * 3_000_000])], schema=SCHEMA))
+        cursor.fetch_arrow_table()
+        # A service can return what it accepted, though the batch exceeds batch_bytes.
+        cursor.execute("SELECT")
+        table = cursor.fetch_arrow_table()
+    assert [(row["i"], len(row["v"])) for batch in worker.rows for row in batch.to_pylist()] == [(7, 3_000_000)]
+    values = cast(list[str], table.column("v").to_pylist())
+    assert table.column("i").to_pylist() == [7]
+    assert [len(v) for v in values] == [3_000_000]
+
+
+def test_native_bind_streams_split_to_a_small_request_limit() -> None:
+    """Many small rows over a 1 MiB request limit are split across bind turns."""
+    driver = _native_driver()
+    import adbc_driver_manager.dbapi as adbc
+
+    worker = StoringWorker()
+    rows = pa.record_batch(
+        [pa.array(range(48)), pa.array([chr(65 + i % 26) * 65_536 for i in range(48)])], schema=SCHEMA
+    )
+    with (
+        _native_host(Limits(request_bytes=1024 * 1024), worker) as options,
+        adbc.connect(driver=driver, entrypoint="AdbcDriverGrainliftInit", db_kwargs=options, autocommit=True) as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.adbc_statement.set_sql_query("store")
+        cursor.adbc_statement.bind_stream(pa.RecordBatchReader.from_batches(SCHEMA, [rows]))
+        cursor.adbc_statement.execute_update()
+    stored = pa.Table.from_batches(worker.rows, SCHEMA)
+    assert len(worker.rows) > 1
+    assert stored.column("i").to_pylist() == list(range(48))
+    assert stored.column("v").to_pylist() == rows.column("v").to_pylist()
+
+
+def test_native_row_larger_than_the_request_is_refused_without_storage() -> None:
+    """Without object storage, a row larger than a request fails with a clear message."""
+    driver = _native_driver()
+    import adbc_driver_manager.dbapi as adbc
+
+    worker = StoringWorker()
+    with (
+        _native_host(Limits(request_bytes=1024 * 1024), worker) as options,
+        adbc.connect(driver=driver, entrypoint="AdbcDriverGrainliftInit", db_kwargs=options, autocommit=True) as conn,
+        conn.cursor() as cursor,
+        pytest.raises(adbc.Error, match="bytes per request"),
+    ):
+        cursor.execute("store", pa.record_batch([pa.array([1]), pa.array(["x" * 2_000_000])], schema=SCHEMA))
+    assert worker.rows == []

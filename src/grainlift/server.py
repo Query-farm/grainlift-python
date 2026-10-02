@@ -513,7 +513,7 @@ class Service:
                 return None
             if not batch.schema.equals(result.query.schema, check_metadata=True):
                 raise AdbcError("Result schema changed", "invalid_data")
-            if batch.get_total_buffer_size() > self.limits.batch_bytes:
+            if batch.get_total_buffer_size() > self._result_batch_bytes():
                 raise AdbcError("Result batch exceeds configured limit", "invalid_data")
             result.sequence += 1
             result.last = batch
@@ -558,7 +558,7 @@ class Service:
                 return None, state
             if not batch.schema.equals(result.query.schema, check_metadata=True):
                 raise AdbcError("Result schema changed", "invalid_data")
-            if batch.get_total_buffer_size() > self.limits.batch_bytes:
+            if batch.get_total_buffer_size() > self._result_batch_bytes():
                 raise AdbcError("Result batch exceeds configured limit", "invalid_data")
             advanced = self._encoded_producer(producer)
         except Exception:
@@ -835,8 +835,11 @@ class Service:
         self._discard_result(session, statement)
         self._discard_upload(statement)
         upload_id = secrets.token_urlsafe(24)
+        # A bound batch is limited by what one request (or an upload through
+        # object storage) can carry, not by batch_bytes: the client sizes bind
+        # turns from the advertised request limit alone.
         statement.upload = BindUpload(
-            schema, limit=self.limits.bind_bytes, batch_limit=self.limits.batch_bytes, stream=stream
+            schema, limit=self.limits.bind_bytes, batch_limit=self._bind_frame_bytes(), stream=stream
         )
         statement.upload_id = upload_id
         return Stream(
@@ -864,6 +867,17 @@ class Service:
             The byte limit.
         """
         return max(self.limits.request_bytes, self._external_upload_bytes)
+
+    def _result_batch_bytes(self) -> int:
+        """Largest result batch: ``batch_bytes``, or anything a client may bind.
+
+        A service can return whatever it accepted, so a bound batch that fits a
+        request (or an upload through object storage) can be read back.
+
+        Returns:
+            The byte limit.
+        """
+        return max(self.limits.batch_bytes, self._bind_frame_bytes())
 
     @guarded
     def push_binding_frame(
@@ -991,7 +1005,9 @@ class Service:
             token_key=secrets.token_bytes(32),
             authenticate=authenticate,
             max_request_bytes=self.limits.request_bytes,
-            max_response_bytes=self.limits.batch_bytes + 1024 * 1024,
+            # Room for the largest inline result batch plus framing; with object
+            # storage, larger batches are stored in the bucket instead.
+            max_response_bytes=max(self.limits.batch_bytes, self.limits.request_bytes) + 1024 * 1024,
             token_ttl=max(1, int(self.limits.idle_seconds)),
             enable_landing_page=False,
             enable_describe_page=False,
